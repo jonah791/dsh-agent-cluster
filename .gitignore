@@ -1,0 +1,16 @@
+# 依赖与构建产物
+node_modules/
+lib/
+coverage/
+
+# 本地状态与备份
+*.log
+*.bak
+*.bak-*
+data/
+.dsh/
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
