@@ -241,17 +241,19 @@
 
 | # | 命题 | 状态 | 证据 |
 |---|---|---|---|
-| A1 | 两节点运行后，各自 `cluster_nodes` 都能看到对方且标记 online | **已验证** | E：`sim-node-a` 出现在名册且标 online |
-| A2 | A `cluster_send` → B 会话收到注入消息，前缀含 `[cluster:A]` | **已验证** | E：会话真实收到 `[cluster:sim-node-b] …`，前缀正确 |
-| A3 | A `cluster_broadcast` → 其余节点都收到，A 自己**不**收到 | **单测覆盖** | U：广播构造与目标过滤（`protocol` / `target` 测试） |
-| A4 | 同一 messageId 重复投递只注入一次 | **单测覆盖** | U：`state.test.mjs` 滚动幂等集合 |
-| A5 | 目标 agent 不可用时消息保留原位，agent 就绪后仍投递 | **已验证** | E：搁浅消息经接管后仍 `delivered`；U：退避重试账 |
-| A6 | 心跳超过 `offlineAfterMs` → 名册标 offline；在线计数同步变化 | **单测覆盖** | U：`identity.test.mjs` 判活阈值 |
-| A7 | 坏 JSON / 缺字段 / 超长 text / 未来版本 → 跳过并落痕，插件不崩 | **单测覆盖** | U：`protocol.test.mjs` + `bus.test.mjs` 坏样本 |
-| A8 | 在线判定 / 名册显示 / 发送警告共用同一阈值常量（判据单源） | **单测覆盖** | U：断言 `DEFAULT_OFFLINE_AFTER_MS` 同源 |
-| A9 | dispose 后无残留定时器、自身心跳文件已移除、无文件句柄泄漏 | **未专门覆盖** | —（HMR 安全相关，建议补一条尸体测试） |
-| A10 | 写失败（只读目录）时工具返回明确错误，不静默；轨迹仍可写时不崩 | **单测覆盖** | U：`bus.test.mjs` 写失败路径 |
-| A11 | 注入消息可从会话事件流重建（Model-visible ⟺ logged） | **已验证** | E：会话事件流中可见注入文本 |
+| A1 | 两节点运行后，各自 `cluster_nodes` 都能看到对方且标记 online | **已实测** | ✔ E：`sim-node-a` 出现在名册且标 online |
+| A2 | A `cluster_send` → B 会话收到注入消息，前缀含 `[cluster:A]` | **已实测** | ✔ E：会话真实收到 `[cluster:sim-node-b] …`，前缀正确 |
+| A3 | A `cluster_broadcast` → 其余节点都收到，A 自己**不**收到 | **单测已验** | ✔ U：广播构造与目标过滤（`protocol` / `target` 测试） |
+| A4 | 同一 messageId 重复投递只注入一次 | **单测已验** | ✔ U：`state.test.mjs` 滚动幂等集合 |
+| A5 | 目标 agent 不可用时消息保留原位，agent 就绪后仍投递 | **已实测** | ✔ E：搁浅消息经接管后仍 `delivered`；U：退避重试账 |
+| A6 | 心跳超过 `offlineAfterMs` → 名册标 offline；在线计数同步变化 | **单测已验** | ✔ U：`identity.test.mjs` 判活阈值 |
+| A7 | 坏 JSON / 缺字段 / 超长 text / 未来版本 → 跳过并落痕，插件不崩 | **单测已验** | ✔ U：`protocol.test.mjs` + `bus.test.mjs` 坏样本 |
+| A8 | 在线判定 / 名册显示 / 发送警告共用同一阈值常量（判据单源） | **单测已验** | ✔ U：断言 `DEFAULT_OFFLINE_AFTER_MS` 同源 |
+| A9 | dispose 后无残留定时器、自身心跳文件已移除、无文件句柄泄漏 | **未覆盖** | ⚠ 待验收：无测试（HMR 安全相关，建议补一条尸体测试） |
+| A10 | 写失败（只读目录）时工具返回明确错误，不静默；轨迹仍可写时不崩 | **单测已验** | ✔ U：`bus.test.mjs` 写失败路径 |
+| A11 | 注入消息可从会话事件流重建（Model-visible ⟺ logged） | **已实测** | ✔ E：会话事件流中可见注入文本 |
+
+> **给解析器与读者的约定（2026-09-15 补）**：`semantic_check` 判定「已证」看的是**证据列（行内最后一个非空单元格）**是否含 `✔`/`✓`/`✅` 或「已实测 / 实测通过 / 已通过验收」；判定「显式待验」看**整行**是否含「待验收 / 待线上验收」。此前我用「**已验证**」写在**状态列**，词不在词表、位置也不对 ⇒ 机器读作「既未证也未标待验」（`unprovenUnmarked`），18 条全被判未证。**声明必须是机器可读的形状，否则等于没有声明。**
 
 > **B 表（v0.2，任务协议与参考适配器）**——与 spec §7-P2 的映射：
 
@@ -260,13 +262,13 @@
 
 | # | 命题 | 对应 spec | 状态 | 证据 |
 |---|---|---|---|---|
-| B1 | 台账缺 `acceptance`（空/占位/过短）→ **拒绝派发**并报错，不静默发出 | P2-1 | **已验证** | 三组不合格全被拒（`exit 3`）：空判据（空格）→「判据为空」· 占位符「待定」→ 拒绝 · 过短「改好」→ 拒绝；合格判据 `exit 0`。另：**参数缺值 → `exit 2` 明确报错**（修复了「静默填 `'true'`」缺陷——PowerShell 吞空串会触发） |
-| B2 | 参考适配器收到任务后**自己拆解**，plan 落盘可见（序号 + 每步意图） | P2-2 | **已验证** | `logs/actions/a-mu1ei9rq-….jsonl` 首条 `stage: start` 的 `detail.plan` = 6 项（`step`/`op`/`target`/`humanText`） |
-| B3 | 结果四字段齐备（status/summary/evidence/unverified），且证据**可被主脑复现** | P2-3 | **已验证** | ① `config.txt`：节点报 `9897034597a904adf9f11c3e0bbbcab3519d74cbce7a61d86d0d09a0b6b7f5e1`，主脑独立复算**逐字符一致** ② `hello.txt`：`13ebcc8e…` 同；且文件字节数 40→33 与一次 `参考适配器`→`ref-node` 替换**算术吻合**（第二重独立证据）。四字段齐备，`unverified` 为空数组而非缺字段 |
-| B4 | 结构性动作**分阶段**落盘（≥ 步数条），非只在结束时一条 | I10 | **已验证** | 6 步任务的 actionId 文件 **8 行** = `start` + 6×`stage` + `done`；每行含 `atMs/actionId/node/actor/step/total/humanText` |
-| B5 | 路径越界（workdir 之外）→ 拒执行并回 `blocked`，不产生副作用 | I11 | **已验证** | `fs.write path:"../evil.txt"` → `status=blocked`（理由「路径越界（workdir 之外）」）；**白名单外无文件产生**；第 2 步**未执行**（`inside-ok.txt` 不存在）；行为事件以 `failed` 收口 |
-| B6 | 同一 `taskId` 重复派发 → 适配器只执行一次（幂等） | I3 的推广 | **已验证** | 重发同 `taskId` → 回 `status=duplicate`；`hello.txt` sha256 **未变**（未被覆盖）；`state/<nodeId>.tasks.json` 的 `handled` 无重复项 |
-| B7 | 执行节点**无直达主人通道**（工具面可验证） | P2-5 | **未达成（架构）** | 预设侧已不挂 `tool-ask-user`；但 `dsh-agent-telegram` 由**宿主组合**提供（`plugin_list` 实测 `挂载: web`），**所有预设**都拿到 ⇒ 预设层面移不掉。需把 telegram 下移主脑预设（U11）。**诚实标注为未达成，不当作已解决** |
+| B1 | 台账缺 `acceptance`（空/占位/过短）→ **拒绝派发**并报错，不静默发出 | P2-1 | **已实测** | ✔ 三组不合格全被拒（`exit 3`）：空判据（空格）→「判据为空」· 占位符「待定」→ 拒绝 · 过短「改好」→ 拒绝；合格判据 `exit 0`。另：**参数缺值 → `exit 2` 明确报错**（修复了「静默填 `'true'`」缺陷——PowerShell 吞空串会触发） |
+| B2 | 参考适配器收到任务后**自己拆解**，plan 落盘可见（序号 + 每步意图） | P2-2 | **已实测** | ✔ `logs/actions/a-mu1ei9rq-….jsonl` 首条 `stage: start` 的 `detail.plan` = 6 项（`step`/`op`/`target`/`humanText`） |
+| B3 | 结果四字段齐备（status/summary/evidence/unverified），且证据**可被主脑复现** | P2-3 | **已实测** | ✔ ① `config.txt`：节点报 `9897034597a904adf9f11c3e0bbbcab3519d74cbce7a61d86d0d09a0b6b7f5e1`，主脑独立复算**逐字符一致** ② `hello.txt`：`13ebcc8e…` 同；且文件字节数 40→33 与一次 `参考适配器`→`ref-node` 替换**算术吻合**（第二重独立证据）。四字段齐备，`unverified` 为空数组而非缺字段 |
+| B4 | 结构性动作**分阶段**落盘（≥ 步数条），非只在结束时一条 | I10 | **已实测** | ✔ 6 步任务的 actionId 文件 **8 行** = `start` + 6×`stage` + `done`；每行含 `atMs/actionId/node/actor/step/total/humanText` |
+| B5 | 路径越界（workdir 之外）→ 拒执行并回 `blocked`，不产生副作用 | I11 | **已实测** | ✔ `fs.write path:"../evil.txt"` → `status=blocked`（理由「路径越界（workdir 之外）」）；**白名单外无文件产生**；第 2 步**未执行**（`inside-ok.txt` 不存在）；行为事件以 `failed` 收口 |
+| B6 | 同一 `taskId` 重复派发 → 适配器只执行一次（幂等） | I3 的推广 | **已实测** | ✔ 重发同 `taskId` → 回 `status=duplicate`；`hello.txt` sha256 **未变**（未被覆盖）；`state/<nodeId>.tasks.json` 的 `handled` 无重复项 |
+| B7 | 执行节点**无直达主人通道**（工具面可验证） | P2-5 | **未达成** | ⚠ 待验收：预设侧已不挂 `tool-ask-user`；但 `dsh-agent-telegram` 由**宿主组合**提供（`plugin_list` 实测 `挂载: web`），**所有预设**都拿到 ⇒ 预设层面移不掉。需把 telegram 下移主脑预设（U11）。**诚实标注为未达成，不当作已解决** |
 
 ## 8. 与实现的关系
 
