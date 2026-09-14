@@ -4,10 +4,10 @@
 
 | 项 | 值 |
 |---|---|
-| 版本 | v0.1（语义稿） |
+| 版本 | v0.2（语义稿；v0.2 增补 P2 任务协议与参考适配器） |
 | 日期 | 2026-09-14 |
-| 状态 | 设计稿 → 实现逼近中（验收清单逐条标注证据） |
-| 实现落点 | `self-plugins/dsh-agent-cluster/src/{index,protocol,identity,bus,target,state}.ts` |
+| 状态 | 实现逼近中（验收清单逐条标注证据；A1–A11 已回修，B1–B7 为 P2 新增） |
+| 实现落点 | `self-plugins/dsh-agent-cluster/src/{index,protocol,identity,bus,target,state}.ts` + `scripts/ref-node.mjs`（参考适配器） |
 | 主副本 | 本文件（`docs/semantic.md`）；无同语义副本 |
 | 设计者 | 爱丽丝（主人 2026-09-14 指令：「创建一个插件多个 DSH 实例之间通讯，打造多智能体工作台」） |
 
@@ -22,6 +22,7 @@
 - **不替 agent 决策**：收到消息只是「注入会话」——回不回、怎么回、要不要行动，由该实例的 agent 自己决定。插件不做自动应答。
 - **不是安全沙箱**：总线目录是普通文件系统对象，同机任何进程都能读写（能力 ≠ 隔离）。总线不存凭据。
 - **不是授权通道**：来自 `cluster` 的消息是**平级实例的来信**，不是主人指令，不获得任何特权（见 §6 信任边界）。
+- **不是任务调度器**（v0.2 明确）：任务台账是**主脑的账本**，插件不轮询台账、不推进状态、不替谁派活——状态推进由主脑按批处理节奏完成（§5.5）。
 
 ## 3. 术语表
 
@@ -36,18 +37,28 @@
 | **收件箱（mailbox）** | `mailbox/<nodeId>/` —— 发送方写入的消息文件；接收方投递成功后移入 `done/` |
 | **投递（deliver）** | 把消息注入本实例会话的动作：`agent.steer(createUserMessage(...))` |
 | **让位/接管** | 不适用——本插件无单点资源所有权，节点之间无互斥（对照 §SOUL 5.19，本条明确不引入） |
+| **主脑（primary）** | 「主人 → 结果」链路的**细化者与裁断者**：产出台账、派发、验收、写 verdict。**是一个角色，不是特权**（可落在任一节点） |
+| **执行节点（worker）** | 按台账 `acceptance` 干活的节点。**认知层不收窄**（可自省/自进化），**操作面按职责收窄** |
+| **任务台账（task ledger）** | `tasks/<taskId>.json` —— 任务的意图、判据、状态、结果与裁决。**唯一写者 = 主脑**（I8） |
+| **行为事件（action event）** | `logs/actions/<actionId>.jsonl` —— 结构性动作的**分阶段**落盘（每步一条），是「实时行为流」的数据源 |
+| **适配器（adapter）** | 让某种运行时成为节点的**中间层**（DSH 只是第一个）。职责：注册心跳 → 收任务 → 执行 → 回结果 → 落行为事件 |
+| **能力声明（capabilities）** | 节点心跳里的 `capabilities[]`——主脑**按能力寻址**（派活前先看节点会不会） |
 
 ## 4. 概念模型与不变量
 
 ```
-        ┌──────────── 共享总线目录 busDir ────────────┐
-        │ nodes/<nodeId>.json        心跳与身份        │
-        │ mailbox/<nodeId>/*.json    收件箱（待投递）   │
-        │ mailbox/<nodeId>/done/     已投递归档        │
-        │ mailbox/<nodeId>/dead/     重试耗尽/过期     │
-        │ state/<nodeId>.json        本节点游标与状态   │
-        │ cluster-trace.jsonl        侧车轨迹（全节点追加）│
-        └──────────────────────────────────────────────┘
+        ┌──────────────────── 共享总线目录 busDir ────────────────────┐
+        │ nodes/<nodeId>.json        心跳与身份（含 capabilities[]）    │
+        │ mailbox/<nodeId>/*.json    收件箱（待投递）                   │
+        │ mailbox/<nodeId>/done/     已投递归档                        │
+        │ mailbox/<nodeId>/dead/     重试耗尽/过期                     │
+        │ tasks/<taskId>.json        任务台账（意图/判据/状态/裁决）     │
+        │ logs/actions/<id>.jsonl    结构性动作分阶段事件（实时行为流）  │
+        │ logs/<nodeId>/<date>.jsonl 节点日志事件                       │
+        │ logs/primary/decisions.jsonl 主脑决策（hash 链）              │
+        │ state/<nodeId>.json        本节点游标与状态                   │
+        │ cluster-trace.jsonl        侧车轨迹（全节点追加）             │
+        └──────────────────────────────────────────────────────────────┘
              ▲                    ▲                 ▲
         nodeA web:3080       nodeB web:3081     nodeC headless
         （每节点只写自己的 nodes/<id>.json 与别人 mailbox 里的消息）
@@ -62,6 +73,10 @@
 - **I5 单写者**：`nodes/<id>.json` 只有该节点写；`mailbox/<to>/*.json` 只有发送方创建（no-clobber）；`done//dead/` 的移动只有接收方做。无多写者竞争。
 - **I6 模型可见即已记录**：注入消息经 `agent.steer(createUserMessage(...))` 进入会话事件流，可被会话日志重建。
 - **I7 观测不反噬**：轨迹/状态落盘失败一律吞错并返回 `false`，绝不影响投递主流程（对照 SOUL 5.22 §3）。
+- **I8 台账单写者**（v0.2）：`tasks/<taskId>.json` **只有主脑写**。执行节点**不写台账**——它只回 `event`/`result` 消息（状态推进由主脑批处理完成）。这样台账零竞争，代价是台账状态滞后于节点实况，最多一个主脑处理周期。
+- **I9 判据先行**（v0.2）：无 `acceptance` 的台账**不得派发**（R8 的机器可判形式）。派发动作前的最后一道检查就是「`acceptance` 非空且非占位符」。
+- **I10 适配器必落行为事件**（v0.2）：结构性动作**不落盘 = 不算节点**。适配器执行每一步必须写一行 `logs/actions/<actionId>.jsonl`；结束必须写 `stage: done|failed` 收口。
+- **I11 路径白名单**（v0.2）：节点只在自己的 `--workdir` 白名单内执行文件操作；**越界即拒**并回 `status: blocked`（不是 `failed`——被拒不是执行失败，是需要主脑改派）。
 
 ## 5. 契约
 
@@ -115,20 +130,114 @@
 | 启动自检 | `apply()` | 立即心跳一次 + 投递积压（不依赖首个定时器 tick） |
 | 卸载 | `ctx.effect` disposer | 清定时器、删自身心跳文件（离线立即可见） |
 
+### 5.5 任务台账（`tasks/<taskId>.json`）· v0.2 新增
+
+```jsonc
+{
+  "v": 1,
+  "taskId": "t-<base36>",
+  "intentRef": "主人的原话摘录",        // 可追溯到「方向」原话，不转述
+  "createdBy": "primary",              // 主脑 nodeId 或角色名
+  "assignee": "<nodeId>",
+  "acceptance": "可执行/可证伪的判据",   // I9：空或占位符 → 禁止派发
+  "grade": "L1",                       // L1 可复现 / L2 可核对 / L3 仅声明
+  "status": "drafted",
+  "steps": ["…"],                      // 可选：主脑给出的粗拆解（节点可自行细化）
+  "lastProgressAt": 0,
+  "budget": { "turns": 20, "toolCalls": 80 },
+  "result": { "status": "…", "summary": "…", "evidence": [], "unverified": [], "learnings": [] },
+  "verdict": { "by": "primary", "at": 0, "pass": true, "method": "复现证据 / 核对证据", "note": "…" }
+}
+```
+
+- **状态机**：`drafted → dispatched → running → returned → verifying → done | failed`；主脑失效期间未验收的落 `pendingVerification`（由新主脑接手）。
+- **写者**：**只有主脑**（I8）。执行节点通过消息（`event` / `result`）回报，由主脑推进状态。
+- **`budget` 是软上限**：节点可自报超限（回 `status: blocked` + 说明），主脑改派或放宽。
+
+### 5.6 任务消息与结果消息 · v0.2 新增
+
+**派发**（`kind: "task"`，`to = assignee`）：
+
+```jsonc
+{ "v": 1, "id": "m-…", "from": "<primary>", "to": "<worker>", "kind": "task",
+  "text": "人读的派活说明（含意图与判据）",
+  "meta": { "taskId": "t-…", "acceptance": "…", "grade": "L1",
+            "payload": { "steps": [ /* 结构化指令，见 5.8 */ ] } } }
+```
+
+**结果**（`kind: "result"`，`meta.replyToTask = taskId`）：
+
+```jsonc
+{ "kind": "result",
+  "meta": { "taskId": "t-…", "status": "ok|failed|blocked|partial",
+            "summary": "一行结论",
+            "evidence": [ { "kind": "file-digest|exit|assert", "path": "…", "sha256": "…", "note": "…" } ],
+            "unverified": ["没能验证的部分"],
+            "learnings": ["可复用经验（回流素材）"] } }
+```
+
+**过程三态**（`kind: "event"`，同 `meta.taskId`）：`started` / `progress` / `blocked`。**不报百分比**（spec §5.1）。
+
+### 5.7 行为事件（`logs/actions/<actionId>.jsonl`）· v0.2 新增
+
+```jsonc
+{ "atMs": 0, "actionId": "a-…", "node": "<nodeId>", "actor": "primary|<nodeId>",
+  "stage": "start|stage|done|failed", "step": 3, "total": 6,
+  "humanText": "正在创建预设目录", "detail": { } }
+```
+
+- **强制分阶段**：结构性动作（创建/销毁实例、部署/更新插件、启停服务、大规模派发）**每步一条**，不得只在结束时写一条（I10）。
+- 这是「实时行为流」的数据源；`humanText` 是给人看的一句话（**显示「正在做什么」，不假装显示「正在想什么」**）。
+- **`actionId` 语义**：一次「结构性动作」= 一个 `actionId`；同一 `actionId` 的条目按写入顺序即时间线。
+
+### 5.8 参考适配器（`scripts/ref-node.mjs`）· v0.2 新增
+
+**存在意义**：它是**协议的活证明**（非 DSH 运行时也能成为节点 ⇒ harness 无关从声称变实测），也是**接入模板**（第三方照它写自己的适配器）。
+
+**职责五拍**（强制，缺一不算节点）：
+
+| # | 拍 | 落点 |
+|---|---|---|
+| 1 | 注册心跳（含 `capabilities[]`） | `nodes/<nodeId>.json` |
+| 2 | 收任务 → **自己拆解**（把 payload 展开为带序号的 plan） | `logs/actions/<actionId>.jsonl` 首条 `stage: start` 的 `detail.plan` |
+| 3 | 逐步执行（每步一条 `stage: stage`） | 同文件的 `step N/total` |
+| 4 | 回结果（四字段 + 证据） | `mailbox/<primary>/<id>.json`，`kind: "result"` |
+| 5 | 收口（`stage: done|failed`）+ 记录已处理任务（幂等） | 同文件 + `state/<nodeId>.tasks.json` |
+
+**指令集（v1，白名单 op）**：
+
+| op | 参数 | 语义 |
+|---|---|---|
+| `fs.mkdir` | `path` | 递归建目录（已存在不算错） |
+| `fs.write` | `path`, `content`, `mode?`（`overwrite`\|`create`） | 写文件；`create` 时已存在 → 拒 |
+| `fs.replace` | `path`, `find`, `replace`, `expectCount?` | 文本替换；命中数与 `expectCount` 不符 → 该步失败 |
+| `fs.remove` | `path`, `recursive?` | 删文件/目录 |
+| `fs.assert` | `path`, `exists?` | **只读断言**，产出 `evidence`（`kind: "assert"`） |
+| `fs.digest` | `path` | 计算 sha256，产出 `evidence`（`kind: "file-digest"`） |
+
+**安全边界**（硬约束）：
+
+- **路径白名单**：所有 `path` 解析后必须位于 `--workdir` 之下；越界 → **拒绝该步并回 `blocked`**（I11）。
+- **不执行 shell**：v1 **不含** `shell.exec`（记 U8 未决）。适配器不 spawn 任何子进程。
+- **规模上限**：单文件 ≤ 1 MiB、单任务 ≤ 64 步、单步超时 30 s；超限即停 + 回 `blocked`。
+- **不做网络**：不发请求、不监听端口。
+
 ## 6. 边界与信任
 
 - **能力边界 ≠ 沙箱**：总线是普通目录；插件不提供也**不承诺**隔离。同机任意进程可读写总线文件。
 - **输入不可信**：所有从总线读入的 JSON 都按不可信数据处理——版本校验、字段类型校验、长度截断、未知键忽略；坏文件跳过 + 轨迹留痕，**绝不抛进主流程**。
 - **不接触凭据**：v0.1 不读写 `.credentials.yaml`，不发起任何网络请求，不监听端口。
 - **不越界清单**：不 kill/重启其他实例；不写其他节点的 `nodes/` 与 `state/`；不删他人消息（只移动自己 mailbox 内的文件）；不自动回复消息。
-- **子进程/资源**：不 spawn 任何子进程。
+- **子进程/资源**：插件不 spawn 任何子进程。
 - **失败面**：写失败（磁盘满/权限）→ 返回错误给调用方（工具面可见），不伪造成功；读失败 → 跳过该条并累计 `readErrors`。
 - **权限语义**：`cluster` 消息是平级来信，注入文本必须带来源前缀（`[cluster:<from>]` / `[cluster:<from>/<kind>]`），且系统提示语义上**不获得主人指令的优先级**。
+- **台账不是授权凭证**（v0.2）：`tasks/*.json` 里出现什么，都不构成对节点操作面的扩大——节点只执行**自己白名单内的 op**，判据字段不改变权限。
+- **执行节点的通道边界**（v0.2，对应 spec P2-5）：执行节点预设**不挂** telegram 等直达主人的通道——它只能回总线（结构性可验证：工具面里没有那些工具）。
 
 ## 7. 可证伪验收清单
 
-> **2026-09-14 状态回修**：原表 11 条全标「待…」，实际已由当日交付验证。逐条给出证据来源。
-> 代号：**U** = 离线单测（`pnpm test`，**58 passed / 0 failed**）· **E** = 端到端联调（两个真实节点 + `scripts/sim-node.mjs`）· **—** = 尚未覆盖。
+> **A 表（v0.1，通讯底座）**：2026-09-14 状态回修——原表 11 条全标「待…」，实际已由当日交付验证。
+> 代号：**U** = 离线单测（`pnpm test`，**58 passed / 0 failed**）· **E** = 端到端联调 · **—** = 尚未覆盖。
 
 | # | 命题 | 状态 | 证据 |
 |---|---|---|---|
@@ -144,14 +253,25 @@
 | A10 | 写失败（只读目录）时工具返回明确错误，不静默；轨迹仍可写时不崩 | **单测覆盖** | U：`bus.test.mjs` 写失败路径 |
 | A11 | 注入消息可从会话事件流重建（Model-visible ⟺ logged） | **已验证** | E：会话事件流中可见注入文本 |
 
-**唯一未覆盖项是 A9**（dispose/HMR 残留）——标注为未验证，不当作已解决。
+> **B 表（v0.2，任务协议与参考适配器）**——与 spec §7-P2 的映射：
+
+| # | 命题 | 对应 spec | 状态 | 证据 |
+|---|---|---|---|---|
+| B1 | 台账缺 `acceptance`（空/占位）→ **拒绝派发**并报错，不静默发出 | P2-1 | 待验 | 计划：离线单测（`tasks` 模块纯函数）+ 端到端一次拒绝样本 |
+| B2 | 参考适配器收到任务后**自己拆解**，plan 落盘可见（序号 + 每步意图） | P2-2 | 待验 | 计划：`logs/actions/<id>.jsonl` 首条 `detail.plan` 长度 = 步数 |
+| B3 | 结果四字段齐备（status/summary/evidence/unverified），且证据**可被主脑复现** | P2-3 | 待验 | 计划：主脑按 `evidence[].sha256` 独立复算并比对 |
+| B4 | 结构性动作**分阶段**落盘（≥ 步数条），非只在结束时一条 | I10 | 待验 | 计划：数 `logs/actions/<id>.jsonl` 行数 == 步数 + 2（start/done） |
+| B5 | 路径越界（workdir 之外）→ 拒执行并回 `blocked`，不产生副作用 | I11 | 待验 | 计划：喂一条 `path: "../evil"` 样本，断言白名单外无文件产生 |
+| B6 | 同一 `taskId` 重复派发 → 适配器只执行一次（幂等） | I3 的推广 | 待验 | 计划：重发同任务，断言 `state/<nodeId>.tasks.json` 与副作用计数 |
+| B7 | 执行节点**无直达主人通道**（工具面可验证） | P2-5 | 待验 | 计划：worker-base 预设的工具面清单核对（结构性） |
 
 ## 8. 与实现的关系
 
-- 主实现：`self-plugins/dsh-agent-cluster/src/`（host-only，无 client 面）。
+- 主实现：`self-plugins/dsh-agent-cluster/src/`（host-only，无 client 面）+ `scripts/ref-node.mjs`（参考适配器，独立进程，非插件代码）。
 - 语义主副本：本文件。`README.md` 面向使用者（安装/配置/用法），不复制语义。
 - 依赖：`ctx.tools`（工具面）、`ctx.agents`（投递）、`ctx.session`（用户会话枚举）。无对其他自研插件的 import（规则：不跨插件内部 import）。
 - 与 `dsh-agent-sentinel` 的关系：**同源规则、独立实现**——哨兵的 `wake-target.ts` 是「唤醒目标裁决」主副本，本插件的 `target.ts` 是「收件投递目标裁决」主副本；两者规则一致但不是同一份代码（跨插件 import 违规），差异需在各自「实践修订记录」里对齐。
+- 与 `alice-workbench` 的关系：工作台**只读**总线（`nodes/` / `mailbox/` / `cluster-trace.jsonl` / `tasks/` / `logs/actions/`），单一写面是 `mailbox/<node>/*.json`（`from: "owner"`）。任务视图的数据源 = `tasks/`。
 
 ## 9. 实践修订记录
 
@@ -160,14 +280,19 @@
 | 2026-09-14 | 立项 | 主人指令；取证确认跨实例投递官方路径（`/api/session/prompt` + browser-auth cookie）与进程内路径（`agent.steer`），v0.1 选**纯文件总线**（无端口、无凭据、跨 DSH_HOME 可用） |
 | 2026-09-14 | **事故** | **插件杀死了宿主 web 进程**：会话尚未装载时 `Session.events === undefined`，`target.ts` 的 `lastRealUserPromptAt` 直读 `.length` → `TypeError` 从 `setInterval` 回调**逃逸**（插件与宿主**同进程**，异常无框架兜底）。指纹：时间线精确到 1 秒（消息到达 10:52:50.2 → 进程消失 10:52:51.1），且**侧车轨迹里没有该消息的任何记录** ⇒ **崩在第一次落盘之前**——所以「没有日志」≠「没被触发」。**修复三层**：① `guarded()` 包住心跳/轮询全部回调 ② `safeDeliver()` 包单条投递 ③ 代理访问各自 try/catch；并加 **4 条源码级守卫契约测试**（`guard-contract.test.mjs`）锁死「新回调不得绕过兜底」。真凶是靠轨迹里一条 `deliver-error` 定案的 |
 | 2026-09-14 | 修复 | **收件箱接管（`takeOverInbox`）**：节点重启后 `nodeId` 带 pid 会改名，旧身份的收件箱必须被接管，否则「改名即丢消息」 |
-| 2026-09-14 | 对齐 | **触发者绑定**（主人口头规则「谁触发，提醒就发到谁」）：同源规则落在 `dsh-agent-plugin-manager`（改用 `exec.agent` 调用者会话）与 `dsh-agent-sentinel`（`wakeTarget` 加 `trustAnchor`——触发者 `updatedAt` 滞后**不作为**腐化证据，因长 turn 期间工具事件不推进 `updatedAt`，误判会导致改投 → 改投目标变活跃 → **正反馈环**）。本插件 `target.ts` 与哨兵 `wake-target.ts` 是同源规则的两个独立实现，本次未改动本插件，记录以备下次对齐 |
+| 2026-09-14 | 对齐 | **触发者绑定**（主人口头规则「谁触发，提醒就发到谁」）：同源规则落在 `dsh-agent-plugin-manager`（改用 `exec.agent` 调用者会话）与 `dsh-agent-sentinel`（`wakeTarget` 加 `trustAnchor`）。本插件 `target.ts` 与哨兵 `wake-target.ts` 是同源规则的两个独立实现，本次未改动本插件，记录以备下次对齐 |
+| 2026-09-14 | **设计修订（v0.2）** | 写 P2 任务协议时发现 spec §3.2 的台账 schema **未指定写者**，而执行节点若直写台账会违反 I5（多写者竞争：主脑写 `verdict`、节点写 `status`/`result`，读-改-写窗口重叠）。**修正为 I8：台账单写者 = 主脑**；执行节点只回 `event`/`result` 消息。代价：台账状态滞后 ≤ 一个主脑处理周期（可接受——台账是验收账本，不是实时进度板；实时进度由 `logs/actions/` 承担）。新增 I9（判据先行）/I10（必落行为事件）/I11（路径白名单）三条不变量 |
+| 2026-09-14 | 补充（v0.2） | **参考适配器升格为协议产物**：`scripts/ref-node.mjs` 从「联调工具」定位为「协议的活证明 + 接入模板」。原 `scripts/sim-node.mjs`（被动模拟器）保留为**测试夹具**，两者职责分离（夹具轻量无副作用；适配器要健壮、要写文档、要被第三方照抄） |
 
 ## 10. 未决问题
 
 - **U1 实时推送通道**：轮询延迟（默认 2s）是否够用？是否需要 HTTP 推送（自建 `/cluster` 路由 + 总线密钥）？——若启用，需先确认非 `/api` 路由是否绕过宿主认证（取证进行中）。
-- **U2 消息语义状态机**：`task`/`result` 是否需要回执（ack）、超时、状态流转？——留给工作台第二阶段。
+- **U2 消息语义状态机**：`task`/`result` 是否需要回执（ack）、超时、状态流转？——**部分回答（v0.2）**：三态回报（started/progress/blocked）与 result 四字段已定；**ack 与超时重派仍未定**。
 - **U3 面板可视化**：名册与消息流是否要以面板呈现（`dsh-panel` 形态）？
 - **U4 跨机安全**：非 loopback 场景的密钥/TLS/白名单——仅在启用推送后才有意义。
 - **U5 主人广播工作台**：是否需要「主会话 → 全体节点派发 + 汇总回收」的一等场景（而非靠广播消息手工拼）？
-- **U6 端口真源**：心跳中 `port` 恒为 `0`、`baseUrl` 为空 ⇒ `webServer` 端口探测失败，名册的「端口/地址」字段当前不可用。需在心跳周期内**重试解析**（对照 §5.11 的锚点腐化处理：锚点不可用则回退运行时真源，两者皆无则显式置空而非填 0）。附带：`nodeId` 因端口缺失而退化为 `web-0`，重启后靠 pid 后缀改名——这既是 U6 的症状，也是收件箱接管机制的由来。
+- **U6 端口真源**：心跳中 `port` 恒为 `0`、`baseUrl` 为空 ⇒ `webServer` 端口探测失败。需在心跳周期内**重试解析**（对照 §5.11 的锚点腐化处理：锚点不可用则回退运行时真源，两者皆无则显式置空而非填 0）。附带：`nodeId` 因端口缺失而退化为 `web-0`，重启后靠 pid 后缀改名——这既是 U6 的症状，也是收件箱接管机制的由来。
 - **U7 语义文档覆盖度**：A9（dispose/HMR 残留）尚无测试，见 §7。
+- **U8 命令执行能力的安全边界**（v0.2）：参考适配器 v1 **不含** `shell.exec`。要做「能跑命令的节点」需要先回答：白名单怎么做（命令级？参数级？）、超时与输出上限、失败如何回传、以及**插件/适配器同权限运行**的风险（能力 ≠ 沙箱）。在回答之前不实现。
+- **U9 台账滞后容忍度**（v0.2）：I8 的代价是台账状态滞后一个主脑处理周期。若主人希望「点开任务即见实时进度」，需要引入**执行侧只读侧车**（如 `logs/actions/` 已承担）或让节点回更频繁的 `progress` 事件——取舍待实测（先看 P2 跑起来后主人是否真的需要实时进度）。
+- **U10 陈旧节点清理**（v0.2）：`nodes/` 会随重启累积历史心跳（实测本机已 13 个 web 节点文件）。名册显示离线节点是**设计意图**（审计价值），但「半年后的 200 个死节点」需要归档策略（如 `nodes/archive/` + 保留期）。未定。
