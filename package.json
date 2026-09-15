@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-cluster",
-  "version": "0.1.0",
-  "description": "DSH 多实例通讯底座：本机（或共享盘）上多个 DSH 实例之间的去中心化消息总线 + 在线名册 + 点对点/广播消息，收到消息注入本实例会话交给 agent 处理。用于搭建多智能体工作台。",
+  "version": "0.2.0",
+  "description": "DSH 多实例通讯底座：本机（或共享盘）上多个 DSH 实例之间的去中心化消息总线 + 在线名册 + 点对点/广播消息，收到消息注入本实例会话交给 agent 处理。用于搭建多智能体工作台。v0.2.0 起带「重启收自己的尸」：同主机同 profile 的死前身心跳/状态在启动时清扫（保守判活，未知不删）。",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

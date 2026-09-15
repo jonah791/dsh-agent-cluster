@@ -30,7 +30,7 @@ import {
   stateFile, tailTrace, takeOverInbox, type BusPaths,
 } from './bus.ts'
 import {
-  ageText, deriveNodeId, nodeOnline, parseHeartbeat, resolveCollision, sanitizeId, type Heartbeat,
+  ageText, deriveNodeId, nodeOnline, parseHeartbeat, resolveCollision, sanitizeId, shouldReap, type Heartbeat,
 } from './identity.ts'
 import {
   DEFAULT_MAX_TEXT_CHARS, injectionText, isExpired, makeMessage, parseMessage, MESSAGE_KINDS,
@@ -170,12 +170,28 @@ const nonce = (): string => String(process.pid) + '-' + Date.now().toString(36) 
  * @param paths - 总线路径
  * @param id - 目标节点 id
  */
-function readHeartbeat(paths: BusPaths, id: string): { pid?: number; atMs?: number } | undefined {
+function readHeartbeat(paths: BusPaths, id: string): { pid?: number; atMs?: number; hostname?: string } | undefined {
   const raw = readJsonValue(nodeFile(paths, id))
   if (!raw.ok) return undefined
   const parsed = parseHeartbeat(raw.value)
   if (!parsed.ok) return undefined
-  return { pid: parsed.hb.pid, atMs: parsed.hb.atMs }
+  return { pid: parsed.hb.pid, atMs: parsed.hb.atMs, hostname: parsed.hb.hostname }
+}
+
+/**
+ * 进程是否还活着（前身判定 / 血统清扫的依据）。
+ * **未知一律按「活着」处理**（pid 非法、EPERM 等）——宁可留垃圾，不可误删活节点（保守优先）。
+ * @param pid - 目标进程号
+ */
+function pidAlive(pid: number): boolean {
+  if (!(typeof pid === 'number' && Number.isFinite(pid) && pid > 0)) return true
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    // ESRCH = 进程不存在；其余（EPERM 等）= 存在但无权限 ⇒ 视为活着
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
 }
 
 /** 名册条目（工具与状态共用）。 */
@@ -213,6 +229,8 @@ export function apply(ctx: Context, config: Config): void {
     : deriveNodeId(facts.hostname, profile, port)
 
   // ── 身份裁决（I1）：同名心跳活跃且非本进程 → 改名避让，绝不覆盖他人 ──
+  // 2026-09-15（Round 3-b）加一层「前身判定」：同名 + 同主机 + 那个 pid 已死 = **我的前身**，不是别人
+  // ⇒ 回收原名（而不是改名避让）。判活事实在 IO 层查得后**显式传入**纯逻辑；未知一律按「活着」处理。
   let identityError = ''
   const pre = ensureBusDirs(paths, requestedId)
   if (!pre.ok) identityError = pre.error ?? '总线目录创建失败'
@@ -223,6 +241,10 @@ export function apply(ctx: Context, config: Config): void {
     Date.now(),
     config.offlineAfterMs,
     String(facts.pid),
+    {
+      pidAlive: existing === undefined || existing.pid === undefined ? true : pidAlive(existing.pid),
+      sameHost: existing?.hostname !== undefined && existing.hostname === facts.hostname,
+    },
   )
   const nodeId = decision.nodeId
   const dirs = ensureBusDirs(paths, nodeId)
@@ -242,8 +264,35 @@ export function apply(ctx: Context, config: Config): void {
   const trace = (phase: string, extra: Record<string, unknown> = {}): void => {
     appendTrace(paths.traceFile, { atMs: Date.now(), node: nodeId, pid: facts.pid, phase, ...extra })
   }
-  trace('startup', { requestedId, nodeId, renamed: decision.renamed, why: decision.why, busRoot, dirsOk: dirs.ok })
+  trace('startup', { requestedId, nodeId, renamed: decision.renamed, reclaimed: decision.reclaimed, why: decision.why, busRoot, dirsOk: dirs.ok })
   if (identityError !== '') logger.error('总线目录异常：' + identityError)
+
+  /**
+   * 血统清扫（Round 3-b · 2026-09-15）：删除**自己的死前身**留下的心跳与状态文件——「重启收自己的尸」。
+   * 判据（纯逻辑 `shouldReap`）：同主机 + 同 profile + id 在 `<host>-<profile>` 前缀内 + pid **确认已死** + 不是自己。
+   * 边界：**不碰别人的节点**（`wb-0`/`ref-0`/其它主机各有其所有者）；**不删消息**（收件箱目录留给各自所有者与审计）。
+   * 动机：每次 web 重启都因「同名心跳仍新鲜」而改名避让，攒下 17 个死心跳 —— 星图把它们画成离线星，
+   * 名册把它们当成节点，而它们只是我的前任。
+   */
+  const sweepLineage = (): { reaped: string[]; kept: number } => {
+    const reaped: string[] = []
+    let kept = 0
+    for (const f of listJsonFiles(paths.nodesDir)) {
+      const id = f.replace(/\.json$/, '')
+      if (id === nodeId) continue
+      const raw = readJsonValue(join(paths.nodesDir, f))
+      if (!raw.ok) { kept++; continue }
+      const parsed = parseHeartbeat(raw.value)
+      if (!parsed.ok) { kept++; continue }
+      if (!shouldReap(parsed.hb, { nodeId, hostname: facts.hostname, profile }, { pidAlive: pidAlive(parsed.hb.pid) })) { kept++; continue }
+      if (!removeIfExists(join(paths.nodesDir, f))) { kept++; continue }
+      removeIfExists(stateFile(paths, id)) // 前身的状态文件同样无用；删失败无害
+      reaped.push(id)
+    }
+    return { reaped, kept }
+  }
+  const swept = sweepLineage()
+  if (swept.reaped.length > 0) trace('reap-lineage', { reaped: swept.reaped.length, ids: swept.reaped, kept: swept.kept })
 
   // ── 状态（I3 幂等集合 + 重试账）──
   const loaded = ((): NodeState => {
