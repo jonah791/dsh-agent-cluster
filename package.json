@@ -15,7 +15,8 @@
   "files": [
     "lib",
     "README.md",
-    "docs"
+    "docs",
+    "dsh-plugin.json"
   ],
   "license": "MIT",
   "keywords": [
