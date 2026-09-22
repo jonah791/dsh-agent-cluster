@@ -51,7 +51,7 @@ import { parseMemberRecord, type MemberRecord } from './transport.ts'
 import { JOIN_PATH, memberDirOf, postJson, pushToPeer, readMembersFromDisk, startHttpNode, type HttpNodeHandle } from './http-node.ts'
 // 入网（§5.11）：令牌 = 一次入网的完整凭据（地址 + 该成员专属密钥 + 已裁决的准入）。
 // 交付形态是「可安装」⇒ 入网必须对方**一步**做完，且**不需要知道我的 busDir**。
-import { decideJoin, describeInvite, mintInvite, parseInvite, redactToken, type InvitePayload } from './invite.ts'
+import { createJoinHandler } from './join.ts'
 
 /** 插件名（Loader 用）。 */
 export const name = 'agent-cluster'
@@ -461,58 +461,28 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
-   * 处理入网请求（`POST /cluster/join`，§5.11）。
+   * 入网裁决（§5.11）——**实现在纯模块 `join.ts`**，这里只注入 IO。
    *
-   * **它不认证请求**——入网方此刻还没有密钥（这正是令牌存在的理由），**令牌自己就是凭证**。
-   * 因此判定必须 fail-closed：缺令牌 / 指纹不符 / 过期 / 网络不符 / 重放 / 身份不符 ⇒ 一律拒，
-   * 且**每次拒绝都落轨迹带理由**（可回答「为什么没进去」，而不是只回一个 401）。
+   * 为什么不在 apply 里内联：内联的逻辑只能靠假 ctx 测，而这一段恰恰是最需要**可跑证据**的
+   * （它是唯一一条「未认证」入口）。抽出来之后 `scripts/join-demo.mjs` 能用真 HTTP 驱动它。
    */
-  const handleJoin = (body: string): { status: number; body: Record<string, unknown> } => {
-    let req: { token?: unknown; member?: unknown }
-    try {
-      req = JSON.parse(body) as { token?: unknown; member?: unknown }
-    } catch {
-      trace('join-reject', { reason: 'bad-json' })
-      return { status: 400, body: { ok: false, reason: 'bad-json' } }
-    }
-    const parsed = parseInvite(req.token, { nowMs: Date.now() })
-    if (!parsed.ok || parsed.invite === undefined) {
-      trace('join-reject', { reason: parsed.reason, detail: parsed.detail, token: typeof req.token === 'string' ? redactToken(req.token) : '' })
-      return { status: 401, body: { ok: false, reason: parsed.reason, detail: parsed.detail } }
-    }
-    const inv = parsed.invite
-    // 入网方自报的成员记录（不可信输入：过 parseMemberRecord 归一，坏了就当没报）
-    const claimant = parseMemberRecord(req.member)
-    const decision = decideJoin(inv, {
-      net: config.network,
-      nowMs: Date.now(),
-      ...(claimant !== null ? { expectedMember: claimant.memberId } : {}),
-      seenNonce: (n) => readUsedNonces().includes(n),
-    })
-    if (!decision.admit) {
-      trace('join-reject', { reason: decision.reason, detail: decision.detail, member: inv.member })
-      return { status: 403, body: { ok: false, reason: decision.reason, detail: decision.detail } }
-    }
-    // 准入：写册子（**含该成员专属密钥**——一人一把，不是一个令牌泄露全网）
-    const rec: MemberRecord = {
-      memberId: inv.member,
-      kind: 'peer',
-      trust: 'known',
-      capabilities: claimant?.capabilities ?? [],
-      protocol: 'v1',
-      ...(claimant?.endpoint !== undefined ? { endpoint: claimant.endpoint } : {}),
-      secret: inv.secret,
-      notes: '通过邀请令牌入网 ' + new Date().toISOString().slice(0, 10),
-    }
-    const w = atomicWriteJson(join(memberDir, inv.member + '.json'), JSON.parse(JSON.stringify(rec)) as unknown, nonce())
-    if (!w.ok) {
-      trace('join-write-failed', { member: inv.member, error: w.error ?? '' })
-      return { status: 500, body: { ok: false, reason: 'member-write-failed' } }
-    }
-    markNonceUsed(inv.nonce)
-    trace('join-admitted', { member: inv.member, net: inv.net, nonce: inv.nonce })
-    return { status: 200, body: { ok: true, net: config.network, host: JSON.parse(JSON.stringify(selfMemberRecord())) as unknown } }
-  }
+  const joins = createJoinHandler({
+    network: config.network,
+    nodeId,
+    profile,
+    nowMs: () => Date.now(),
+    trace: (event, fields) => trace(event, fields ?? {}),
+    readUsedNonces,
+    markNonceUsed,
+    writeMember: (rec) => {
+      const w = atomicWriteJson(join(memberDir, rec.memberId + '.json'), JSON.parse(JSON.stringify(rec)) as unknown, nonce())
+      return w.ok ? { ok: true } : { ok: false, ...(w.error !== undefined ? { error: w.error } : {}) }
+    },
+    selfRecord: selfMemberRecord,
+    myBaseUrl: joinBaseUrl,
+    post: (url, body) => postJson({ url, body }),
+  })
+  const handleJoin = joins.handleJoin
 
   let httpNode: HttpNodeHandle | undefined
   if (config.listenPort > 0) {
@@ -1229,31 +1199,7 @@ export function apply(ctx: Context, config: Config): void {
       render: (_a: unknown, v: Record<string, unknown>) => [{ type: 'text', text: '入网令牌（发给 ' + String(v['member']) + ' · 到期 ' + String(v['expiresAt']) + '）：\n' + String(v['token']) + '\n' + String(v['inviteLine']) + '\n对方把令牌交给它的实例后执行 cluster_join 即入网。' + (String(v['warning'] ?? '') !== '' ? '\n⚠ ' + String(v['warning']) : '') }],
     },
     async execute(args: { member: string; ttlMinutes?: number; url?: string }) {
-      const base = args.url !== undefined && args.url !== '' ? args.url : joinBaseUrl()
-      if (base === '') throw new Error('本节点没有入站端点（config.listenPort 为 0 且未给 url）——对方无处投递入网请求，签不出可用令牌')
-      const ttl = (args.ttlMinutes !== undefined && args.ttlMinutes > 0 ? args.ttlMinutes : 1440) * 60_000
-      const m = mintInvite({ net: config.network, url: base, host: nodeId, member: args.member, nowMs: Date.now(), ttlMs: ttl })
-      if (!m.ok || m.invite === undefined) throw new Error('令牌生成失败：' + m.detail)
-      const inv: InvitePayload = m.invite
-      // **签发即准入**：此刻就把该成员写进册子（含它专属的密钥）——准入决定不留给入网方。
-      const rec: MemberRecord = {
-        memberId: inv.member, kind: 'peer', trust: 'known', capabilities: [], protocol: 'v1',
-        secret: inv.secret, notes: '已签发邀请令牌 ' + new Date().toISOString().slice(0, 10),
-      }
-      const w = atomicWriteJson(join(memberDir, inv.member + '.json'), JSON.parse(JSON.stringify(rec)) as unknown, nonce())
-      if (!w.ok) throw new Error('成员册写入失败：' + (w.error ?? ''))
-      // 轨迹只记**隐去密钥**的形态：token 本体进会话（要给人看），但不进侧车长期留存。
-      trace('invite-minted', { member: inv.member, net: inv.net, exp: inv.exp, base })
-      const loopback = base.startsWith('http://127.0.0.1') || base.startsWith('http://localhost')
-      return {
-        ok: true,
-        member: inv.member,
-        token: m.token,
-        joinUrl: base + JOIN_PATH,
-        expiresAt: new Date(inv.exp).toISOString(),
-        inviteLine: describeInvite(inv),
-        ...(loopback ? { warning: '基址是回环地址——只有**同一台机器**上的实例能用这张令牌；跨机邀请要用对方能访问到的地址重签（url 参数）' } : {}),
-      }
+      return joins.mintInviteFor(args)
     },
   }))
 
@@ -1277,36 +1223,7 @@ export function apply(ctx: Context, config: Config): void {
       render: (_a: unknown, v: Record<string, unknown>) => [{ type: 'text', text: '已入网：成员 ' + String(v['member']) + ' → 网络 ' + String(v['net']) + '（主脑 ' + String(v['host']) + '）\n双方已互相入册，可互相投递。' }],
     },
     async execute(args: { token: string }) {
-      const parsed = parseInvite(args.token, { nowMs: Date.now(), expectMember: nodeId })
-      if (!parsed.ok || parsed.invite === undefined) throw new Error('令牌不可用（' + parsed.reason + '）：' + parsed.detail)
-      const inv = parsed.invite
-      const base = joinBaseUrl()
-      const me: MemberRecord = {
-        memberId: nodeId, kind: 'peer', trust: 'known', capabilities: ['cluster'], protocol: 'v1',
-        ...(base !== '' ? { endpoint: base } : {}),
-        notes: 'profile ' + profile,
-      }
-      const r = await postJson({ url: inv.url + JOIN_PATH, body: JSON.stringify({ token: args.token, member: JSON.parse(JSON.stringify(me)) as unknown }) })
-      trace('join-request', { host: inv.host, net: inv.net, ok: r.ok, status: r.status, ...(r.ok ? {} : { reason: r.reason }) })
-      if (!r.ok) throw new Error('入网请求被拒（HTTP ' + String(r.status) + '）：' + r.reason)
-      let resp: { ok?: unknown; net?: unknown; host?: unknown; reason?: unknown; detail?: unknown }
-      try {
-        resp = JSON.parse(r.body) as typeof resp
-      } catch {
-        throw new Error('主脑响应不是 JSON（前 200 字符）：' + r.body.slice(0, 200))
-      }
-      if (resp.ok !== true) throw new Error('主脑拒绝入网（' + String(resp.reason ?? 'unknown') + '）：' + String(resp.detail ?? ''))
-      const hostRec = parseMemberRecord(resp.host)
-      if (hostRec === null) throw new Error('主脑响应里没有可解析的成员记录——无法把它写进本机册子')
-      // 把主脑写进本机册子。密钥用令牌里的**专属**密钥：主脑出站签它，我入站验它（§5.11）。
-      const mine: MemberRecord = {
-        ...hostRec, trust: 'known', secret: inv.secret,
-        notes: '通过邀请令牌入网的主脑 ' + new Date().toISOString().slice(0, 10),
-      }
-      const w = atomicWriteJson(join(memberDir, mine.memberId + '.json'), JSON.parse(JSON.stringify(mine)) as unknown, nonce())
-      if (!w.ok) throw new Error('写入主脑成员记录失败：' + (w.error ?? ''))
-      trace('join-ok', { net: inv.net, host: mine.memberId, member: nodeId })
-      return { ok: true, net: String(resp.net ?? inv.net), host: mine.memberId, member: nodeId }
+      return joins.joinNetwork(args.token)
     },
   }))
 

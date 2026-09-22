@@ -260,10 +260,15 @@ export async function pushToPeer(opts: {
   }
 }
 
-/** 未认证 POST 的结果（判别式联合：成功给 `body`、失败给 `reason`——**两种语义不许混读**）。 */
+/**
+ * 未认证 POST 的结果（判别式联合）。
+ * `reason` = **短标签**（`http-403` / `network: …` / `url-…`）；`body` = **服务端响应正文**
+ * ——真正的诊断在正文里，所以两个分支都带 `body`（曾经只放在失败分支的 reason 里，
+ * 结果是「服务端说明了原因，调用方却只看到一个状态码」）。
+ */
 export type PostJsonResult =
   | { ok: true; status: number; body: string }
-  | { ok: false; status: number; reason: string }
+  | { ok: false; status: number; reason: string; body: string }
 
 /**
  * 未认证的 JSON POST——**只给入网用**（§5.11）。
@@ -278,7 +283,7 @@ export async function postJson(opts: {
   timeoutMs?: number
 }): Promise<PostJsonResult> {
   const rejection = peerUrlRejection(opts.url)
-  if (rejection !== null) return { ok: false, status: 0, reason: 'url-' + rejection }
+  if (rejection !== null) return { ok: false, status: 0, reason: 'url-' + rejection, body: '' }
   const doFetch = opts.fetchImpl ?? fetch
   const ac = new AbortController()
   const timer = setTimeout(() => ac.abort(), opts.timeoutMs ?? 10_000)
@@ -295,10 +300,10 @@ export async function postJson(opts: {
     } catch {
       text = ''
     }
-    if (!res.ok) return { ok: false, status: res.status, reason: 'http-' + String(res.status) + (text !== '' ? ': ' + text.slice(0, 200) : '') }
+    if (!res.ok) return { ok: false, status: res.status, reason: 'http-' + String(res.status), body: text }
     return { ok: true, status: res.status, body: text }
   } catch (e) {
-    return { ok: false, status: 0, reason: 'network: ' + (e instanceof Error ? e.message : String(e)) }
+    return { ok: false, status: 0, reason: 'network: ' + (e instanceof Error ? e.message : String(e)), body: '' }
   } finally {
     clearTimeout(timer)
   }
