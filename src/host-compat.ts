@@ -4,8 +4,16 @@
  * This plugin ships as an *installable* artifact: the target host's DSH release is
  * chosen by whoever installs it, not by us (the upstream `dsh-tavern` pins
  * `0.1.2-rc.1` while this machine runs `0.1.6-alpha.2`). `inject` guarantees a
- * service *exists*, but says nothing about the API shape *on* it — `Session.events`
- * was removed in 0.1.6, `snapshotEvents()` exists only there.
+ * service *exists*, but says nothing about the API shape *on* it.
+ *
+ * ⚠ **2026-09-22 更正（本条曾写错，留痕不改史）**：原先此处写着「`Session.events` 在 0.1.6
+ * 被移除、`snapshotEvents()` 只有 0.1.6 有」——那是**未核实的假设**，不是读数。静态取证
+ * （读 `0.1.2-rc.1` 自己的 `dsh-session/lib/index.js` 与它自己的类声明）显示：**两个世代的
+ * 会话读取面同形**——都有 `snapshotEvents()` / `ownEvents()` / `eventAt()` / `seq`，
+ * **都没有**公开 `events` 属性。⇒ `events` 那条回退**不是为这两代准备的**，只是给未知/
+ * 更旧宿主留的兜底（`via` 会如实报出实际走了哪条）。
+ * **教训：假设一旦被写进代码注释与文档，就会被后来的人（包括我自己）当成读数**——
+ * 凡未经实测的形状断言，要么显式标「推断」，要么当场取证。
  *
  * Contract (see docs/semantic.md §5.10): every probe is side-effect free and
  * **never throws**. A missing capability degrades to "no candidate session",
@@ -25,19 +33,21 @@ export type HostVerdict = 'supported' | 'degraded' | 'unsupported'
 /** A declared-supported host, with the strength of that claim spelled out. */
 export interface SupportedHost {
   dsh: string
-  /** `实测` = verified on that host; `推断` = inferred from its API surface alone. */
-  tested: '实测' | '推断'
+  /**
+   * 声明强度三档——**「没跑过」与「跑过」之间还有一档**，不该被压成两档：
+   * `实测` = 在该宿主上真跑过；`静态` = 读过该宿主自己的代码/类型声明（未运行）；`推断` = 只是推断，无证据。
+   */
+  tested: '实测' | '静态' | '推断'
   note: string
 }
 
 /**
- * Declared support range. **This is a declaration, not a guarantee** — an entry
- * marked `推断` has not been exercised on that host, so it must not be read as
- * "supported".
+ * Declared support range. **This is a declaration, not a guarantee** — `实测`/`静态` 都只覆盖
+ * 它各自那句话说到的范围；标 `推断` 的条目不得当作「已支持」。
  */
 export const SUPPORTED_HOSTS: readonly SupportedHost[] = [
-  { dsh: '0.1.6-alpha.2', tested: '实测', note: '本机主力宿主：`events` 属性已移除，走 `snapshotEvents()`' },
-  { dsh: '0.1.2-rc.1', tested: '推断', note: '上游 dsh-tavern 锁定版本：无 `snapshotEvents`，走 `events` 属性。⚠ 尚未装进该宿主实测（§10 U13）' },
+  { dsh: '0.1.6-alpha.2', tested: '实测', note: '本机主力宿主：会话读取走 `snapshotEvents()`（线上 `cluster_status` 实测读数）' },
+  { dsh: '0.1.2-rc.1', tested: '静态', note: '上游 dsh-tavern 锁定版本。**静态取证**（读它自己的 `dsh-session/lib/index.js` 与类声明）：Session 有 `snapshotEvents()`/`ownEvents()`/`eventAt()`/`seq`、**无**公开 `events` 属性 ⇒ 与本机世代的会话读取面**同形**。另有结构性实测：插件已在该宿主里**挂载并运行过**（共享总线轨迹 `phase=startup` + 心跳）。⚠ **未在该宿主取得运行期 `host-compat` 读数**（§10 U13）' },
 ]
 
 export interface CallablePick<F> {
@@ -96,12 +106,14 @@ export function pickCallable<F>(obj: unknown, names: readonly string[]): Callabl
 }
 
 /**
- * Read a session's event history across host generations.
+ * Read a session's event history, tolerating host generations.
  *
- * Order is deliberate: `snapshotEvents()` first (0.1.6+, where the property is
- * gone), then the `events` property (0.1.2-rc.1, where the method is absent).
+ * Order: `snapshotEvents()` first — it is present in **both** hosts we have evidence
+ * for (0.1.2-rc.1 static, 0.1.6 measured) — then a plain `events` property as a
+ * fallback for older/unknown hosts (⚠ 这两个世代**都没有**该属性；它是兜底，不是常规路径).
  * Anything unexpected — a throw, a non-array — falls through to the next path and
- * is reported in `via` / `fellBack` rather than thrown.
+ * is reported in `via` / `fellBack` rather than thrown: `via` is the honest record
+ * of which path actually served this session.
  */
 export function readSessionEvents<T = unknown>(session: unknown): SessionEventsRead<T> {
   let fellBack = false
@@ -202,7 +214,7 @@ export function probeHostCompat(sessions: readonly unknown[], options: ProbeOpti
   }
 
   if (sawSnapshot) reasons.push('走 snapshotEvents()（上游已标 deprecated）——现在可用，长久方向是改读投影')
-  if (sawProperty) reasons.push('走 events 属性（0.1.6 前的路径）——该属性在上游 0.1.6 已移除')
+  if (sawProperty) reasons.push('走 events 属性回退（两个已知世代都没有这个属性 ⇒ 宿主形状不在预期内，值得看一眼）')
   if (fellBack > 0) reasons.push(String(fellBack) + ' 个会话的 snapshotEvents 抛错/非数组，已回退')
 
   const { version, source } = readVersion(options.env)

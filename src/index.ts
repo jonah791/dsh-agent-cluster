@@ -567,9 +567,11 @@ export function apply(ctx: Context, config: Config): void {
   const sessionLite = (): SessionLite[] => {
     try {
       const list = ctx.sessions.list()
-      // 跨版本读事件：0.1.6+ 走 `snapshotEvents()`，0.1.2-rc.1（上游 dsh-tavern 锁定的版本）
-      // 只有 `events` 属性。探测实现**单源**在 `host-compat.ts`——判定与读取共用同一份，
-      // 两处各写一份必然漂移（本插件已经有「一份实现散在多处」的教训）。
+      // 会话历史读取：探测实现**单源**在 `host-compat.ts`——判定与读取共用同一份，
+      // 两处各写一份必然漂移（本插件已有「一份实现散在多处」的教训）。
+      // ⚠ **别在这里写版本断言**：2026-09-22 此处曾写「0.1.2-rc.1 只有 events 属性」，
+      // 那是未核实的假设且是错的（两个已知世代的会话读取面同形：都有 snapshotEvents()、
+      // 都没有公开 events 属性）。凡形状断言要么标「推断」，要么当场取证。
       const reads = list.map((s) => readSessionEvents<SessionEventLite>(s))
       noteCompat(list)
       return list.map((s, i) => ({
