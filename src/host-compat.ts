@@ -34,10 +34,18 @@ export type HostVerdict = 'supported' | 'degraded' | 'unsupported'
 export interface SupportedHost {
   dsh: string
   /**
-   * 声明强度三档——**「没跑过」与「跑过」之间还有一档**，不该被压成两档：
-   * `实测` = 在该宿主上真跑过；`静态` = 读过该宿主自己的代码/类型声明（未运行）；`推断` = 只是推断，无证据。
+   * 声明强度四档——**「没跑过」与「跑过」之间还有两档**，不该被压成两档：
+   * - `实测` = **在该宿主进程内**真跑过（读数来自宿主自己，如线上 `cluster_status`）；
+   * - `进程外运行期` = **执行了该宿主所带的真实产物**（进程外导入并枚举其运行期 API 面）——
+   *   比「读源码」强（跑的是它实际运行的那份构建），比「进程内实测」弱（不在它的进程里，
+   *   拿不到它自己算出的裁决）；
+   * - `静态` = 读过该宿主自己的代码/类型声明（**未运行**）；
+   * - `推断` = 只是推断，无证据。
+   *
+   * ⚠ 2026-09-22 由三档扩为四档：`进程外运行期` 这个证据原先**无处安放**（既不是静态，
+   * 也不是进程内实测）⇒ **档位不够会逼人撒谎**（要么 overclaim 成实测，要么 underclaim 成静态）。
    */
-  tested: '实测' | '静态' | '推断'
+  tested: '实测' | '进程外运行期' | '静态' | '推断'
   note: string
 }
 
@@ -47,7 +55,18 @@ export interface SupportedHost {
  */
 export const SUPPORTED_HOSTS: readonly SupportedHost[] = [
   { dsh: '0.1.6-alpha.2', tested: '实测', note: '本机主力宿主：会话读取走 `snapshotEvents()`（线上 `cluster_status` 实测读数）' },
-  { dsh: '0.1.2-rc.1', tested: '静态', note: '上游 dsh-tavern 锁定版本。**静态取证**（读它自己的 `dsh-session/lib/index.js` 与类声明）：Session 有 `snapshotEvents()`/`ownEvents()`/`eventAt()`/`seq`、**无**公开 `events` 属性 ⇒ 与本机世代的会话读取面**同形**。另有结构性实测：插件已在该宿主里**挂载并运行过**（共享总线轨迹 `phase=startup` + 心跳）。⚠ **未在该宿主取得运行期 `host-compat` 读数**（§10 U13）' },
+  {
+    dsh: '0.1.2-rc.1',
+    tested: '进程外运行期',
+    note: '上游 dsh-tavern 锁定版本（酒馆实例两侧实测均为 0.1.2-rc.1）。'
+      + '**进程外运行期取证（2026-09-22）**：进程外导入该宿主所带的 `dsh-session@0.1.2-rc.1` 并枚举 `Session.prototype` ⇒ '
+      + '`snapshotEvents` / `ownEvents` / `eventAt` / `seq` / `surface` 齐全、**无**公开 `events` 属性 '
+      + '⇒ 与本机世代（0.1.6-alpha.2）的会话读取面**同形**。'
+      + '另有结构性实测：插件已在该宿主里**挂载并运行过**（共享总线轨迹 `phase=startup` + `startup-poll` + 心跳）。'
+      + '⚠ **仍未取得该宿主进程内的 `host-compat` 读数**——探针按设计在 `sampled===0` 时不落轨迹（无会话＝时机不是故障），'
+      + '而该实例 `data/chats` 为空、`.credentials.yaml` 无任何 provider 键 ⇒ 建会话需主人提供模型凭据（§10 U13）。'
+      + '**更正**：早前「预期会话读取 = events-property」的说法源自一个未核实的假设，已被本读数**证伪**。',
+  },
 ]
 
 export interface CallablePick<F> {

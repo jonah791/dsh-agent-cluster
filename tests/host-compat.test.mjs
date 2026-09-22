@@ -170,22 +170,47 @@ test('describeCompat：一行可读，含判定/读取路径/版本（未取得�
   assert.ok(line.includes('未取得'), '版本取不到必须显示为「未取得」，不能空白或写 0')
 })
 
-test('声称诚实性：三档声明各有要求（实测/静态/推断），且「静态」不得被读成运行期读数', () => {
+/**
+ * 档位契约：给一条声明，返回它违反的项（空数组＝合规）。
+ * 抽成函数是为了**能喂合成坏样本**——否则「当前没有静态条目」会让对应那段断言恒空转，
+ * 而恒为空的检查不是证据（§5.9 规则 2）。
+ */
+function tierViolations(h) {
+  const bad = []
+  if (!['实测', '进程外运行期', '静态', '推断'].includes(h.tested)) bad.push('tested 不在四档内')
+  if (!h.note || h.note.length === 0) bad.push('缺 note')
+  if (h.tested === '进程外运行期') {
+    if (!/进程外/.test(h.note)) bad.push('未自曝「进程外」取证方式')
+    if (!/未.*(进程内|host-compat|实测)|尚未/.test(h.note)) bad.push('未写明「仍未取得进程内读数」')
+  }
+  if (h.tested === '静态') {
+    if (!/静态/.test(h.note)) bad.push('未自曝「静态取证」')
+    if (!/未.*(运行期|实测)|尚未/.test(h.note)) bad.push('未写明「未取得运行期读数」')
+  }
+  if (h.tested === '推断' && !/未|尚未|没/.test(h.note)) bad.push('推断条目未明说没实测过')
+  return bad
+}
+
+test('声称诚实性：四档声明各有要求（实测/进程外运行期/静态/推断），且低档不得被读成运行期读数', () => {
   assert.ok(SUPPORTED_HOSTS.length > 0)
   for (const h of SUPPORTED_HOSTS) {
-    assert.ok(['实测', '静态', '推断'].includes(h.tested), 'tested 只能取三档之一：' + String(h.tested))
+    assert.deepEqual(tierViolations(h), [], `声明不合档位契约：${h.dsh}`)
     assert.ok(h.note.length > 0, '每条声明都要有 note 说明它那句话的边界：' + h.dsh)
   }
-  // 静态 = 读过对方代码/类型声明，但**没跑过** ⇒ note 必须让读者看得出这不是运行期读数。
-  // （2026-09-22 新增这一档的原因：原先只有 实测/推断 两档，于是「我读了对方代码」无处安放，
-  //   被硬塞进「推断」，而它其实比我瞎猜强得多——档位不够会逼人撒谎。）
-  for (const h of SUPPORTED_HOSTS.filter((x) => x.tested === '静态')) {
-    assert.ok(/静态/.test(h.note), '静态条目必须自曝「静态取证」：' + h.dsh)
-    assert.ok(/未.*(运行期|实测)|尚未/.test(h.note), '静态条目必须写明「未取得运行期读数」：' + h.dsh)
-  }
-  // 推断 = 无证据 ⇒ 必须自曝
-  for (const h of SUPPORTED_HOSTS.filter((x) => x.tested === '推断')) {
-    assert.ok(/未|尚未|没/.test(h.note), '推断条目必须在 note 里明说没实测过：' + h.dsh)
+  // 档位来历：原先只有 实测/推断 两档，「我读了对方代码」无处安放被硬塞进「推断」；
+  // 2026-09-22 「执行了对方所带的真实产物」同样无处安放（既非静态也非进程内）
+  // ⇒ 再扩一档。两次都是同一句话：**档位不够会逼人撒谎**。
+
+  // 对照（合成坏样本）：契约必须**能被违反**——证明上面那段不是恒绿。
+  const controls = [
+    [{ dsh: 'x', tested: '实测', note: '' }, 'missing-note'],
+    [{ dsh: 'x', tested: '进程外运行期', note: '跑过了，没问题' }, 'op-claims-nothing'],
+    [{ dsh: 'x', tested: '静态', note: '读过了，肯定没问题' }, 'static-sounds-like-runtime'],
+    [{ dsh: 'x', tested: '推断', note: '应该是支持的' }, 'infer-not-self-disclosing'],
+    [{ dsh: 'x', tested: '大概吧', note: '随便' }, 'unknown-tier'],
+  ]
+  for (const [sample, label] of controls) {
+    assert.ok(tierViolations(sample).length > 0, `对照组必须被抓出（${label}）`)
   }
 })
 
