@@ -91,6 +91,11 @@ export interface MemberRecord {
   protocol?: string
   /** 可达地址（跨机成员给 URL）。 */
   endpoint?: string
+  /**
+   * 该成员**专属**密钥（§5.11 邀请令牌下发）；缺席 ⇒ 回退网络共享密钥。
+   * 有了它，「一个令牌泄露」不会连累其他成员——**一人一把**。
+   */
+  secret?: string
   notes?: string
 }
 
@@ -110,6 +115,8 @@ export function parseMemberRecord(raw: unknown): MemberRecord | null {
   const rec: MemberRecord = { memberId: o.memberId, kind, trust, capabilities }
   if (typeof o.protocol === 'string') rec.protocol = o.protocol
   if (typeof o.endpoint === 'string') rec.endpoint = o.endpoint
+  // 专属密钥过短一律不采信（宁可不认，也不用一条弱密钥去验签）
+  if (typeof o.secret === 'string' && o.secret.length >= 16) rec.secret = o.secret
   if (typeof o.notes === 'string') rec.notes = o.notes
   return rec
 }
@@ -165,8 +172,13 @@ export function decideInbound(input: {
 }): InboundDecision {
   if (!input.allowInbound) return { ok: false, status: 503, reason: 'inbound-disabled' }
   if (input.memberId === '') return { ok: false, status: 403, reason: 'no-member-id' }
+  // 密钥选择：该成员有**专属**密钥就用它（§5.11 令牌下发），否则回退网络共享密钥。
+  // ⚠ 这不改变判定顺序——**密钥来源**要先查成员记录，但**语义**仍是
+  // 「签名失败 401（证明不了身份）/ 签名通过但非成员 403（证明得了但没被允许）」，
+  // 两条不能混（§5.9 规则 1 的语义精确性）。
+  const sender = input.members.find((m) => m.memberId === input.memberId)
   const v = verifySignature({
-    secret: input.secret,
+    secret: sender?.secret ?? input.secret,
     body: input.body,
     timestampMs: input.timestampMs,
     signature: input.signature,

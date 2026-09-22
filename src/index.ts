@@ -48,7 +48,10 @@ import { describeCompat, probeHostCompat, probeServices, readSessionEvents, type
 // 跨机承载（`docs/members.md` §5）：传输适配器 + 自开端点 + 成员册。
 // 这一层是对 §6「不做网络」的**有意修订**——纪律是默认关闭 + fail-closed。
 import { parseMemberRecord, type MemberRecord } from './transport.ts'
-import { memberDirOf, pushToPeer, readMembersFromDisk, startHttpNode, type HttpNodeHandle } from './http-node.ts'
+import { JOIN_PATH, memberDirOf, postJson, pushToPeer, readMembersFromDisk, startHttpNode, type HttpNodeHandle } from './http-node.ts'
+// 入网（§5.11）：令牌 = 一次入网的完整凭据（地址 + 该成员专属密钥 + 已裁决的准入）。
+// 交付形态是「可安装」⇒ 入网必须对方**一步**做完，且**不需要知道我的 busDir**。
+import { decideJoin, describeInvite, mintInvite, parseInvite, redactToken, type InvitePayload } from './invite.ts'
 
 /** 插件名（Loader 用）。 */
 export const name = 'agent-cluster'
@@ -100,6 +103,8 @@ export interface Config {
   allowInbound: boolean
   /** 跨机传输共享密钥（空 = 既不收也不发；fail-closed）。 */
   secret: string
+  /** 网络名（§5.11）：令牌带着它，防止一张令牌被用去另一个网络（`not-my-network`）。 */
+  network: string
 }
 
 /** 配置 schema（默认值即本机单机可用值）。 */
@@ -123,6 +128,7 @@ export const Config = z.object({
   listenPort: z.number().default(0),
   allowInbound: z.boolean().default(false),
   secret: z.string().default(''),
+  network: z.string().default('dsh-cluster'),
 })
 
 /** 运行时探测结果（进程环境事实，不是配置）。 */
@@ -409,6 +415,105 @@ export function apply(ctx: Context, config: Config): void {
   // **默认关闭**：`listenPort === 0` 时不启动任何监听、不发任何请求 ⇒ 与加网络层前逐字节相同。
   const memberDir = memberDirOf(busRoot)
   const readMemberList = (): MemberRecord[] => readMembersFromDisk(memberDir, parseMemberRecord).members
+
+  // ── 入网（§5.11）：令牌 = 一次入网的完整凭据 ──
+  // 缺口：成员册原本要**手工写 JSON** 才算加入。但本插件的交付形态是「装了这个插件的智能体
+  // 都能接入网络」（主人 2026-09-22 定义）⇒ 入网必须对方**一步**做完，且不必知道我的 busDir
+  // （地址写在令牌里）。这里只放**裁决**；令牌本身的解析/校验在纯模块 `invite.ts`。
+  const joinUsedFile = join(busRoot, 'join-used.json')
+  /** 已用 nonce 上限：长期运行不许无限增长（真正的清理策略见 §10 U14）。 */
+  const JOIN_USED_CAP = 500
+
+  const readUsedNonces = (): string[] => {
+    const raw = readJsonValue(joinUsedFile)
+    if (!raw.ok) return []
+    const o = raw.value as { nonces?: unknown } | null
+    const list = o !== null && typeof o === 'object' ? o.nonces : undefined
+    return Array.isArray(list) ? list.filter((n): n is string => typeof n === 'string') : []
+  }
+
+  /** 标记令牌已用（防重放）。读-改-写窗口内的并发由上层「一台主脑」假设兜住（§5.14）。 */
+  const markNonceUsed = (n: string): void => {
+    const list = readUsedNonces()
+    if (list.includes(n)) return
+    list.push(n)
+    atomicWriteJson(joinUsedFile, { nonces: list.slice(-JOIN_USED_CAP), updatedAt: Date.now() }, nonce())
+  }
+
+  /** 我自己的入站基址；**没有端点 ⇒ 空串**（此时签不出可用的令牌，因为对方没有可回的地址）。 */
+  const joinBaseUrl = (): string => {
+    const port = httpNode?.port ?? config.listenPort
+    return port > 0 ? 'http://127.0.0.1:' + String(port) : ''
+  }
+
+  /** 回给入网方的「主脑记录」。 */
+  const selfMemberRecord = (): MemberRecord => {
+    const base = joinBaseUrl()
+    return {
+      memberId: nodeId,
+      kind: 'self',
+      trust: 'known',
+      capabilities: ['cluster'],
+      protocol: 'v1',
+      ...(base !== '' ? { endpoint: base } : {}),
+      notes: 'cluster 主脑（profile ' + profile + '，网络 ' + config.network + '）',
+    }
+  }
+
+  /**
+   * 处理入网请求（`POST /cluster/join`，§5.11）。
+   *
+   * **它不认证请求**——入网方此刻还没有密钥（这正是令牌存在的理由），**令牌自己就是凭证**。
+   * 因此判定必须 fail-closed：缺令牌 / 指纹不符 / 过期 / 网络不符 / 重放 / 身份不符 ⇒ 一律拒，
+   * 且**每次拒绝都落轨迹带理由**（可回答「为什么没进去」，而不是只回一个 401）。
+   */
+  const handleJoin = (body: string): { status: number; body: Record<string, unknown> } => {
+    let req: { token?: unknown; member?: unknown }
+    try {
+      req = JSON.parse(body) as { token?: unknown; member?: unknown }
+    } catch {
+      trace('join-reject', { reason: 'bad-json' })
+      return { status: 400, body: { ok: false, reason: 'bad-json' } }
+    }
+    const parsed = parseInvite(req.token, { nowMs: Date.now() })
+    if (!parsed.ok || parsed.invite === undefined) {
+      trace('join-reject', { reason: parsed.reason, detail: parsed.detail, token: typeof req.token === 'string' ? redactToken(req.token) : '' })
+      return { status: 401, body: { ok: false, reason: parsed.reason, detail: parsed.detail } }
+    }
+    const inv = parsed.invite
+    // 入网方自报的成员记录（不可信输入：过 parseMemberRecord 归一，坏了就当没报）
+    const claimant = parseMemberRecord(req.member)
+    const decision = decideJoin(inv, {
+      net: config.network,
+      nowMs: Date.now(),
+      ...(claimant !== null ? { expectedMember: claimant.memberId } : {}),
+      seenNonce: (n) => readUsedNonces().includes(n),
+    })
+    if (!decision.admit) {
+      trace('join-reject', { reason: decision.reason, detail: decision.detail, member: inv.member })
+      return { status: 403, body: { ok: false, reason: decision.reason, detail: decision.detail } }
+    }
+    // 准入：写册子（**含该成员专属密钥**——一人一把，不是一个令牌泄露全网）
+    const rec: MemberRecord = {
+      memberId: inv.member,
+      kind: 'peer',
+      trust: 'known',
+      capabilities: claimant?.capabilities ?? [],
+      protocol: 'v1',
+      ...(claimant?.endpoint !== undefined ? { endpoint: claimant.endpoint } : {}),
+      secret: inv.secret,
+      notes: '通过邀请令牌入网 ' + new Date().toISOString().slice(0, 10),
+    }
+    const w = atomicWriteJson(join(memberDir, inv.member + '.json'), JSON.parse(JSON.stringify(rec)) as unknown, nonce())
+    if (!w.ok) {
+      trace('join-write-failed', { member: inv.member, error: w.error ?? '' })
+      return { status: 500, body: { ok: false, reason: 'member-write-failed' } }
+    }
+    markNonceUsed(inv.nonce)
+    trace('join-admitted', { member: inv.member, net: inv.net, nonce: inv.nonce })
+    return { status: 200, body: { ok: true, net: config.network, host: JSON.parse(JSON.stringify(selfMemberRecord())) as unknown } }
+  }
+
   let httpNode: HttpNodeHandle | undefined
   if (config.listenPort > 0) {
     void startHttpNode({
@@ -436,6 +541,7 @@ export function apply(ctx: Context, config: Config): void {
           trace('http-inbound-error', { from, message: e instanceof Error ? e.message : String(e) })
         }
       },
+      onJoin: handleJoin,
       trace,
     }).then((h) => {
       httpNode = h
@@ -1090,10 +1196,117 @@ export function apply(ctx: Context, config: Config): void {
       const kinds = ['chat', 'task', 'result', 'event', 'alert']
       const kind = (args.kind !== undefined && kinds.includes(args.kind) ? args.kind : 'chat') as MessageKind
       const msg = makeMessage({ from: nodeId, to: args.to, text: args.text, kind }, Date.now(), randomBytes(4).toString('hex'))
-      const r = await pushToPeer({ url: m.endpoint, secret: config.secret, body: JSON.stringify(msg), fromMemberId: nodeId })
+      // 密钥选择：该成员有**专属**密钥（邀请令牌下发）就用它，否则回退网络共享密钥（§5.11）。
+      const r = await pushToPeer({ url: m.endpoint, secret: m.secret ?? config.secret, body: JSON.stringify(msg), fromMemberId: nodeId })
       trace('peer-push', { to: args.to, id: msg.id, ok: r.ok, status: r.status, reason: r.reason ?? null })
       if (!r.ok) throw new Error('跨机投递失败（HTTP ' + String(r.status) + '）：' + (r.reason ?? 'unknown'))
       return { ok: true, to: args.to, id: msg.id, status: r.status }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'cluster_invite',
+    description: '签发一张「入网令牌」给某个智能体——它一步就能接入本网络（**不需要知道我的总线目录**）。令牌里带网络名、我的入站地址、该成员**专属**密钥与到期时间。签发即准入（同时写进成员册）。⚠ 令牌是凭据：只该经可信渠道交给对方，不要公开发。',
+    parameters: {
+      member: { type: 'string', required: true, description: '被邀请者的成员 id（一张令牌只准入这一个 id）' },
+      ttlMinutes: { type: 'number', description: '有效期（分钟，缺省 1440 = 24 小时）' },
+      url: { type: 'string', description: '我的入站基址覆盖（缺省 http://127.0.0.1:<listenPort>）；跨机邀请必须填对方能访问到的地址' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          member: { type: 'string', required: true },
+          token: { type: 'string', required: true },
+          joinUrl: { type: 'string', required: true },
+          expiresAt: { type: 'string', required: true },
+          inviteLine: { type: 'string', required: true },
+          warning: { type: 'string' },
+        },
+      },
+      render: (_a: unknown, v: Record<string, unknown>) => [{ type: 'text', text: '入网令牌（发给 ' + String(v['member']) + ' · 到期 ' + String(v['expiresAt']) + '）：\n' + String(v['token']) + '\n' + String(v['inviteLine']) + '\n对方把令牌交给它的实例后执行 cluster_join 即入网。' + (String(v['warning'] ?? '') !== '' ? '\n⚠ ' + String(v['warning']) : '') }],
+    },
+    async execute(args: { member: string; ttlMinutes?: number; url?: string }) {
+      const base = args.url !== undefined && args.url !== '' ? args.url : joinBaseUrl()
+      if (base === '') throw new Error('本节点没有入站端点（config.listenPort 为 0 且未给 url）——对方无处投递入网请求，签不出可用令牌')
+      const ttl = (args.ttlMinutes !== undefined && args.ttlMinutes > 0 ? args.ttlMinutes : 1440) * 60_000
+      const m = mintInvite({ net: config.network, url: base, host: nodeId, member: args.member, nowMs: Date.now(), ttlMs: ttl })
+      if (!m.ok || m.invite === undefined) throw new Error('令牌生成失败：' + m.detail)
+      const inv: InvitePayload = m.invite
+      // **签发即准入**：此刻就把该成员写进册子（含它专属的密钥）——准入决定不留给入网方。
+      const rec: MemberRecord = {
+        memberId: inv.member, kind: 'peer', trust: 'known', capabilities: [], protocol: 'v1',
+        secret: inv.secret, notes: '已签发邀请令牌 ' + new Date().toISOString().slice(0, 10),
+      }
+      const w = atomicWriteJson(join(memberDir, inv.member + '.json'), JSON.parse(JSON.stringify(rec)) as unknown, nonce())
+      if (!w.ok) throw new Error('成员册写入失败：' + (w.error ?? ''))
+      // 轨迹只记**隐去密钥**的形态：token 本体进会话（要给人看），但不进侧车长期留存。
+      trace('invite-minted', { member: inv.member, net: inv.net, exp: inv.exp, base })
+      const loopback = base.startsWith('http://127.0.0.1') || base.startsWith('http://localhost')
+      return {
+        ok: true,
+        member: inv.member,
+        token: m.token,
+        joinUrl: base + JOIN_PATH,
+        expiresAt: new Date(inv.exp).toISOString(),
+        inviteLine: describeInvite(inv),
+        ...(loopback ? { warning: '基址是回环地址——只有**同一台机器**上的实例能用这张令牌；跨机邀请要用对方能访问到的地址重签（url 参数）' } : {}),
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'cluster_join',
+    description: '用一张入网令牌接入一个智能体网络：解析 → 校验（令牌是否授予**本节点**）→ 把入网请求推到令牌里的地址 → 双方互相入册。成功后本节点与主脑即可互相投递（cluster_peer）。',
+    parameters: {
+      token: { type: 'string', required: true, description: '对方给的入网令牌（形态 dshc1.<载荷>.<指纹>）' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          net: { type: 'string', required: true },
+          host: { type: 'string', required: true },
+          member: { type: 'string', required: true },
+        },
+      },
+      render: (_a: unknown, v: Record<string, unknown>) => [{ type: 'text', text: '已入网：成员 ' + String(v['member']) + ' → 网络 ' + String(v['net']) + '（主脑 ' + String(v['host']) + '）\n双方已互相入册，可互相投递。' }],
+    },
+    async execute(args: { token: string }) {
+      const parsed = parseInvite(args.token, { nowMs: Date.now(), expectMember: nodeId })
+      if (!parsed.ok || parsed.invite === undefined) throw new Error('令牌不可用（' + parsed.reason + '）：' + parsed.detail)
+      const inv = parsed.invite
+      const base = joinBaseUrl()
+      const me: MemberRecord = {
+        memberId: nodeId, kind: 'peer', trust: 'known', capabilities: ['cluster'], protocol: 'v1',
+        ...(base !== '' ? { endpoint: base } : {}),
+        notes: 'profile ' + profile,
+      }
+      const r = await postJson({ url: inv.url + JOIN_PATH, body: JSON.stringify({ token: args.token, member: JSON.parse(JSON.stringify(me)) as unknown }) })
+      trace('join-request', { host: inv.host, net: inv.net, ok: r.ok, status: r.status, ...(r.ok ? {} : { reason: r.reason }) })
+      if (!r.ok) throw new Error('入网请求被拒（HTTP ' + String(r.status) + '）：' + r.reason)
+      let resp: { ok?: unknown; net?: unknown; host?: unknown; reason?: unknown; detail?: unknown }
+      try {
+        resp = JSON.parse(r.body) as typeof resp
+      } catch {
+        throw new Error('主脑响应不是 JSON（前 200 字符）：' + r.body.slice(0, 200))
+      }
+      if (resp.ok !== true) throw new Error('主脑拒绝入网（' + String(resp.reason ?? 'unknown') + '）：' + String(resp.detail ?? ''))
+      const hostRec = parseMemberRecord(resp.host)
+      if (hostRec === null) throw new Error('主脑响应里没有可解析的成员记录——无法把它写进本机册子')
+      // 把主脑写进本机册子。密钥用令牌里的**专属**密钥：主脑出站签它，我入站验它（§5.11）。
+      const mine: MemberRecord = {
+        ...hostRec, trust: 'known', secret: inv.secret,
+        notes: '通过邀请令牌入网的主脑 ' + new Date().toISOString().slice(0, 10),
+      }
+      const w = atomicWriteJson(join(memberDir, mine.memberId + '.json'), JSON.parse(JSON.stringify(mine)) as unknown, nonce())
+      if (!w.ok) throw new Error('写入主脑成员记录失败：' + (w.error ?? ''))
+      trace('join-ok', { net: inv.net, host: mine.memberId, member: nodeId })
+      return { ok: true, net: String(resp.net ?? inv.net), host: mine.memberId, member: nodeId }
     },
   }))
 

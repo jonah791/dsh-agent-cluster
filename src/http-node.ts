@@ -22,6 +22,11 @@ import type { MemberRecord } from './transport.ts'
 export const INBOX_PATH = '/cluster/inbox'
 /** 存活探针路径：**未认证**且只回协议版本（不含任何敏感信息）。 */
 export const PING_PATH = '/cluster/ping'
+/**
+ * 入网路径（§5.11）。**故意不认证**——入网方此刻还没有密钥，这正是邀请令牌存在的理由：
+ * **令牌自己就是凭证**，由调用方（`index.ts`）用 `parseInvite` + `decideJoin` 裁决。
+ */
+export const JOIN_PATH = '/cluster/join'
 
 /**
  * 轨迹写入函数形状。
@@ -42,6 +47,11 @@ export interface HttpNodeOptions {
   members: () => readonly MemberRecord[]
   /** 收到**已通过全部准入**的消息正文时调用（调用方负责落进本地总线收件箱）。 */
   onInbound: (body: string, fromMemberId: string) => void
+  /**
+   * 入网请求（§5.11）。**不注入 ⇒ 该路径 404**（功能关闭时**不假装支持**）。
+   * 本模块只搬字节：判定（令牌好不好、该不该准入）留在调用方，返回值即 HTTP 状态与响应体。
+   */
+  onJoin?: (body: string) => { status: number; body: Record<string, unknown> }
   trace: TraceFn
   /** 时钟（测试可注入）。 */
   nowMs?: () => number
@@ -116,6 +126,24 @@ export function startHttpNode(opts: HttpNodeOptions): Promise<HttpNodeHandle> {
       const url = (req.url ?? '').split('?')[0]
       if (req.method === 'GET' && url === PING_PATH) {
         reply(res, 200, { ok: true, protocol: 'v1' })
+        return
+      }
+      if (req.method === 'POST' && url === JOIN_PATH && opts.onJoin !== undefined) {
+        const onJoin = opts.onJoin
+        void readBody(req, maxBodyBytes).then((r) => {
+          try {
+            if (!r.ok) {
+              opts.trace('http-join-reject', { reason: r.reason })
+              reply(res, 413, { ok: false, reason: r.reason })
+              return
+            }
+            const out = onJoin(r.body)
+            reply(res, out.status, out.body)
+          } catch (e) {
+            opts.trace('http-join-error', { message: e instanceof Error ? e.message : String(e) })
+            reply(res, 500, { ok: false, reason: 'internal' })
+          }
+        })
         return
       }
       if (req.method !== 'POST' || url !== INBOX_PATH) {
@@ -225,6 +253,50 @@ export async function pushToPeer(opts: {
       signal: ac.signal,
     })
     return res.ok ? { ok: true, status: res.status } : { ok: false, status: res.status, reason: 'http-' + String(res.status) }
+  } catch (e) {
+    return { ok: false, status: 0, reason: 'network: ' + (e instanceof Error ? e.message : String(e)) }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** 未认证 POST 的结果（判别式联合：成功给 `body`、失败给 `reason`——**两种语义不许混读**）。 */
+export type PostJsonResult =
+  | { ok: true; status: number; body: string }
+  | { ok: false; status: number; reason: string }
+
+/**
+ * 未认证的 JSON POST——**只给入网用**（§5.11）。
+ *
+ * 与 `pushToPeer` 的唯一区别是它**不签名**：入网方此刻还没有任何共享密钥（这正是令牌的理由）。
+ * ⚠ 但**地址策略照旧 fail-closed**——不合规地址连请求都不发。安全默认不因为「这是入网」而放开。
+ */
+export async function postJson(opts: {
+  url: string
+  body: string
+  fetchImpl?: typeof fetch
+  timeoutMs?: number
+}): Promise<PostJsonResult> {
+  const rejection = peerUrlRejection(opts.url)
+  if (rejection !== null) return { ok: false, status: 0, reason: 'url-' + rejection }
+  const doFetch = opts.fetchImpl ?? fetch
+  const ac = new AbortController()
+  const timer = setTimeout(() => ac.abort(), opts.timeoutMs ?? 10_000)
+  try {
+    const res = await doFetch(opts.url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+      body: opts.body,
+      signal: ac.signal,
+    })
+    let text = ''
+    try {
+      text = await res.text()
+    } catch {
+      text = ''
+    }
+    if (!res.ok) return { ok: false, status: res.status, reason: 'http-' + String(res.status) + (text !== '' ? ': ' + text.slice(0, 200) : '') }
+    return { ok: true, status: res.status, body: text }
   } catch (e) {
     return { ok: false, status: 0, reason: 'network: ' + (e instanceof Error ? e.message : String(e)) }
   } finally {
