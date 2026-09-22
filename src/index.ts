@@ -41,6 +41,10 @@ import {
   serializeState, type NodeState,
 } from './state.ts'
 import { decideTarget, type SessionLite } from './target.ts'
+// 跨机承载（`docs/members.md` §5）：传输适配器 + 自开端点 + 成员册。
+// 这一层是对 §6「不做网络」的**有意修订**——纪律是默认关闭 + fail-closed。
+import { parseMemberRecord, type MemberRecord } from './transport.ts'
+import { memberDirOf, pushToPeer, readMembersFromDisk, startHttpNode, type HttpNodeHandle } from './http-node.ts'
 
 /** 插件名（Loader 用）。 */
 export const name = 'agent-cluster'
@@ -82,6 +86,16 @@ export interface Config {
   autoInject: boolean
   /** 名册最多列出多少节点（防总线目录膨胀拖慢工具）。 */
   maxRoster: number
+  /**
+   * 跨机入站监听端口；**0 = 关闭**（默认）。
+   * 默认关闭是硬纪律：加网络层是对 `semantic.md` §6「不做网络」的**有意修订**，
+   * 不配置时必须与加网络前的行为**逐字节相同**（见 `docs/members.md` §5.3）。
+   */
+  listenPort: number
+  /** 是否接受入站（缺省 `false`；跨机互联要显式打开）。 */
+  allowInbound: boolean
+  /** 跨机传输共享密钥（空 = 既不收也不发；fail-closed）。 */
+  secret: string
 }
 
 /** 配置 schema（默认值即本机单机可用值）。 */
@@ -102,6 +116,9 @@ export const Config = z.object({
   mainSessionId: z.string().default(''),
   autoInject: z.boolean().default(true),
   maxRoster: z.number().default(200),
+  listenPort: z.number().default(0),
+  allowInbound: z.boolean().default(false),
+  secret: z.string().default(''),
 })
 
 /** 运行时探测结果（进程环境事实，不是配置）。 */
@@ -384,16 +401,69 @@ export function apply(ctx: Context, config: Config): void {
     return { ok: true, id: msg.id, duplicate: r.duplicate }
   }
 
+  // ── 跨机承载（`docs/members.md` §5）──
+  // **默认关闭**：`listenPort === 0` 时不启动任何监听、不发任何请求 ⇒ 与加网络层前逐字节相同。
+  const memberDir = memberDirOf(busRoot)
+  const readMemberList = (): MemberRecord[] => readMembersFromDisk(memberDir, parseMemberRecord).members
+  let httpNode: HttpNodeHandle | undefined
+  if (config.listenPort > 0) {
+    void startHttpNode({
+      port: config.listenPort,
+      secret: config.secret,
+      allowInbound: config.allowInbound,
+      members: readMemberList,
+      // 入站消息**复用既有投递管线**：落进本机收件箱，其余交给轮询 → 裁决 → 注入。
+      // 这样跨机与同机走同一条投递逻辑（不制造第二条路径，也就不会漂移）。
+      onInbound: (body, from) => {
+        try {
+          const parsed = parseMessage(JSON.parse(body) as unknown, { maxTextChars: config.maxTextChars })
+          if (!parsed.ok) {
+            trace('http-inbound-bad-envelope', { from, reason: parsed.reason })
+            return
+          }
+          const msg = parsed.message
+          if (isHandled(state, msg.id)) {
+            trace('http-inbound-duplicate', { id: msg.id, from })
+            return
+          }
+          const r = atomicWriteJson(join(inbox, msg.id + '.json'), JSON.parse(JSON.stringify(msg)) as unknown, nonce())
+          trace('http-inbound-stored', { id: msg.id, from, kind: msg.kind, ok: r.ok })
+        } catch (e) {
+          trace('http-inbound-error', { from, message: e instanceof Error ? e.message : String(e) })
+        }
+      },
+      trace,
+    }).then((h) => {
+      httpNode = h
+      trace('http-ready', { port: h.port })
+    }).catch((e: unknown) => {
+      trace('http-start-failed', { message: e instanceof Error ? e.message : String(e) })
+    })
+    ctx.effect(() => () => { void httpNode?.close() })
+  }
+
   // ── 投递（接收侧）──
   const sessionLite = (): SessionLite[] => {
     try {
-      return ctx.sessions.list().map((s) => ({
-        id: String(s.id),
-        delegationDepth: Number(s.header?.delegationDepth ?? 0),
-        // `Session.events` 在会话尚未装载时可能为 undefined（2026-09-14 线上实测：
-        // 直接读 `.length` → TypeError，且该异常当时从定时器逃逸、杀死宿主 web 进程）。归一为空数组。
-        events: Array.isArray(s.events) ? (s.events as unknown as SessionLite['events']) : [],
-      }))
+      return ctx.sessions.list().map((s) => {
+        // DSH 0.1.6 适配：`Session.events` 公共属性已移除 —— 同步读取 Session 历史
+        // 已全线弃用（见 .agents/notes/implemented/architecture/
+        // 2026-09-09-deprecate-synchronous-session-event-reads.md）。改用同语义的
+        // snapshotEvents()；仍保留归一，防会话未装载时抛错。
+        // （历史事故：直接读 `.length` → TypeError，异常从定时器逃逸杀死宿主 web 进程。）
+        let events: SessionLite['events'] = []
+        try {
+          const raw = s.snapshotEvents()
+          if (Array.isArray(raw)) events = raw as unknown as SessionLite['events']
+        } catch {
+          // 归一为空数组：会话尚未装载时保持「无候选会话」语义
+        }
+        return {
+          id: String(s.id),
+          delegationDepth: Number(s.header?.delegationDepth ?? 0),
+          events,
+        }
+      })
     } catch (e) {
       // cordis 严格代理下 ctx.sessions 访问可能抛错（dsh-agent-plugin-manager 同款已知现象）；
       // 退化为「无候选会话」→ 投递走 no-target 分支退避重试——绝不让异常逃逸出定时器。
@@ -855,6 +925,103 @@ export function apply(ctx: Context, config: Config): void {
       if (want === 'all' || want === 'done') for (const f of listJsonFiles(join(inbox, 'done'))) push(f, join(inbox, 'done'), 'done')
       if (want === 'all' || want === 'dead') for (const f of listJsonFiles(join(inbox, 'dead'))) push(f, join(inbox, 'dead'), 'dead')
       return { ok: true, pending: pendingFiles().length, items: items.slice(0, limit) }
+    },
+  }))
+
+  // ---------- cluster_members（成员册：身份与信任，`docs/members.md` §3/§4）----------
+  ctx.tools.register(defineTool({
+    name: 'cluster_members',
+    description: '列出网络成员册（身份与信任）：memberId / kind / trust / 能力 / 端点 / 协议，以及跨机承载状态。**trust=unknown 一律不投也不收**——不要靠「自称」当成员。',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          members: { type: 'json', required: true },
+          skipped: { type: 'json', required: true },
+          transport: { type: 'json', required: true },
+        },
+      },
+      render: (_a: unknown, v: Record<string, unknown>) => {
+        const members = Array.isArray(v['members']) ? (v['members'] as Array<Record<string, unknown>>) : []
+        const tr = (v['transport'] ?? {}) as Record<string, unknown>
+        const head = '成员册 ' + String(members.length) + ' 位｜跨机承载：监听 ' + (tr['listening'] === true ? String(tr['listenPort']) : '关闭') + '｜入站 ' + (tr['allowInbound'] === true ? '开' : '关') + '｜密钥 ' + (tr['secretConfigured'] === true ? '已配' : '未配')
+        if (members.length === 0) {
+          const skipped = Array.isArray(v['skipped']) ? (v['skipped'] as string[]) : []
+          return [{ type: 'text', text: head + '\n（空册——把成员记录写进 <busDir>/members/<memberId>.json 即入册；trust 只认 own/known）' + (skipped.length > 0 ? '\n跳过 ' + String(skipped.length) + ' 个坏记录：' + skipped.join('、') : '') }]
+        }
+        const lines = members.map((m) => {
+          const caps = Array.isArray(m['capabilities']) ? (m['capabilities'] as string[]) : []
+          return '- [' + String(m['trust']) + '/' + String(m['kind']) + '] ' + String(m['memberId']) +
+            (m['endpoint'] === undefined ? '' : ' @ ' + String(m['endpoint'])) +
+            (caps.length > 0 ? '\n  能力：' + caps.join('、') : '')
+        })
+        return [{ type: 'text', text: head + '\n' + lines.join('\n') }]
+      },
+    },
+    async execute() {
+      const inv = readMembersFromDisk(memberDir, parseMemberRecord)
+      // 显式构造（而不是 JSON round-trip）+ 具体类型：schema 的 `type: 'json'` 需要 JsonValue，
+      // `unknown` 过不了；显式字段也让「投影出去的是哪几个字段」一眼可见（§5.30 显式先于隐式）。
+      const members = inv.members.map((m) => ({
+        memberId: m.memberId,
+        kind: m.kind,
+        trust: m.trust,
+        capabilities: [...m.capabilities],
+        ...(m.endpoint !== undefined ? { endpoint: m.endpoint } : {}),
+        ...(m.protocol !== undefined ? { protocol: m.protocol } : {}),
+        ...(m.notes !== undefined ? { notes: m.notes } : {}),
+      }))
+      return {
+        members,
+        skipped: [...inv.skipped],
+        transport: {
+          listenPort: config.listenPort,
+          allowInbound: config.allowInbound,
+          listening: httpNode !== undefined,
+          secretConfigured: config.secret !== '',
+        },
+      }
+    },
+  }))
+
+  // ---------- cluster_peer（跨机投递，`docs/members.md` §5.3）----------
+  ctx.tools.register(defineTool({
+    name: 'cluster_peer',
+    description: '把一条消息推给**跨机成员**（按其成员册里的 endpoint + HMAC 认证）。同机成员请用 cluster_send。要求已配 secret，且 endpoint 为 https 或本机回环（明文 http 到非回环一律拒发）。',
+    parameters: {
+      to: { type: 'string', required: true, description: '成员 id（见 cluster_members）' },
+      text: { type: 'string', required: true, description: '消息正文' },
+      kind: { type: 'string', enum: ['chat', 'task', 'result', 'event', 'alert'], description: '消息类别（缺省 chat）' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          to: { type: 'string', required: true },
+          id: { type: 'string', required: true },
+          status: { type: 'number', required: true },
+        },
+      },
+      render: (_a: unknown, v: Record<string, unknown>) => [{ type: 'text', text: '已跨机投递 → ' + String(v['to']) + '（' + String(v['id']) + '，HTTP ' + String(v['status']) + '）' }],
+    },
+    async execute(args: { to: string; text: string; kind?: string }) {
+      const members = readMembersFromDisk(memberDir, parseMemberRecord).members
+      const m = members.find((x) => x.memberId === args.to)
+      if (m === undefined) throw new Error('成员册里没有 ' + args.to + '（先用 cluster_members 看册子）')
+      if (m.trust === 'unknown') throw new Error('成员 ' + args.to + ' 的信任级是 unknown——先确认身份再投递（fail-closed）')
+      if (m.endpoint === undefined || m.endpoint === '') throw new Error('成员 ' + args.to + ' 没登记 endpoint')
+      if (config.secret === '') throw new Error('未配置跨机密钥（config.secret 为空）——拒绝以无签名形态发送')
+      const kinds = ['chat', 'task', 'result', 'event', 'alert']
+      const kind = (args.kind !== undefined && kinds.includes(args.kind) ? args.kind : 'chat') as MessageKind
+      const msg = makeMessage({ from: nodeId, to: args.to, text: args.text, kind }, Date.now(), randomBytes(4).toString('hex'))
+      const r = await pushToPeer({ url: m.endpoint, secret: config.secret, body: JSON.stringify(msg), fromMemberId: nodeId })
+      trace('peer-push', { to: args.to, id: msg.id, ok: r.ok, status: r.status, reason: r.reason ?? null })
+      if (!r.ok) throw new Error('跨机投递失败（HTTP ' + String(r.status) + '）：' + (r.reason ?? 'unknown'))
+      return { ok: true, to: args.to, id: msg.id, status: r.status }
     },
   }))
 
