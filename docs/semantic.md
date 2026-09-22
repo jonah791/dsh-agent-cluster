@@ -269,6 +269,41 @@ cd self-plugins/dsh-agent-cluster && node scripts/peer-demo.mjs
 
 **边界诚实**：HMAC 只挡**跨机 / 跨用户**的伪装；同机同用户的进程仍能读 `DSH_HOME` 里的密钥——§6 已承认这一点，本节**不改这个判断**。
 
+### 5.10 宿主兼容与版本容忍（能力探测优先于版本号）· 2026-09-22 新增
+
+**缺口（为什么需要这一节）**：本插件的**交付形态是「可安装」**——装到谁的机器上、对方的 DSH 是什么版本，**由对方决定，不由我决定**。上游 `dsh-tavern` 就锁在一个**比我更旧**的版本（`0.1.2-rc.1` vs 我本机 `0.1.6-alpha.2`）。第一个真实差异已实测到手：`Session.events`（0.1.2-rc.1 有）vs `snapshotEvents()`（0.1.6+ 有，且上游已标 deprecated）。
+
+**三条规则**：
+
+1. **能力探测优先于版本号**。版本字符串**是提示、不是判据**——同一版本的不同构建/发行版能力可以不同，而版本号比较（`0.1.2-rc.1 < 0.1.6`）**推不出「哪个 API 在」**。判据永远是「**这个 API 在不在**」。
+2. **`inject` 只保证「服务在」，保证不了「服务上的 API 还在」**。`inject` 是 cordis 的**激活门**（服务缺席 ⇒ 插件不激活），所以被注入的服务必然可用；但**服务对象上的方法与属性会跨版本漂移**（`Session.events` 就是这样丢的）。⇒ 服务存在性交给 `inject`（结构性保证），**API 形状交给探测**（运行期判断）。
+3. **探测无副作用、绝不抛**。探测发生在 `apply` 期与投递链路里——**与宿主同进程**，抛异常会杀死宿主 web（§9 · 2026-09-14 事故）。所有探测经 `pickCallable` / `readSessionEvents`（内部吞错并**如实记录经由哪条路径**），**未知一律降级为「无候选会话」，绝不抛**。
+
+**契约面**（`src/host-compat.ts`，纯模块，可离线测）：
+
+| 导出 | 语义 |
+|---|---|
+| `pickCallable(obj, names)` | 按序返回第一个**可调用**成员（`{ name, fn }`）；非对象 / 全无 ⇒ `undefined`；**不抛** |
+| `readSessionEvents(session)` | 返回 `{ events, via, fellBack }`；`via ∈ 'snapshotEvents' \| 'events-property' \| 'none'`；非数组归一为 `[]`；**不抛** |
+| `probeHostCompat(sessions)` | 聚合探测：`sessionEvents` 采样 × `version`（尽力取得，取不到是常态）× `verdict ∈ supported \| degraded \| unsupported` × `reasons[]` |
+| `describeCompat(compat)` | 一行可读串（落轨迹 / 工具面显示用） |
+| `SUPPORTED_HOSTS` | **声明支持区间**：每条 `{ dsh, tested: '实测' \| '推断', note }`——实测过的与推断的**分列**，不许混为一谈 |
+
+**判定语义**（`verdict`）：
+
+- `supported`：会话历史读取路径可用（`via !== 'none'`）。
+- `degraded`：**能跑但会变笨**——典型是 `sessionEvents === 'none'`（投递目标裁决退化为「无最近活跃」，**不报错、只变笨**）；或**尚无会话可采样**（`no-sessions-yet`：不是错，是时机）。
+- `unsupported`：必需服务面自证缺失。⚠ 正常路径下**不该出现**（`inject` 会先让插件不激活）——出现即说明探测看到了异常宿主，须记录而非掩盖。
+
+⚠ **`degraded` 必须响亮**：不许静默。落 `host-degraded` 轨迹 + `cluster_status` 的 `host` 段直接显示原因。（教训来自本插件自身：`s.events` 取不到时**不报错**，只是所有会话历史恒为空。）
+
+**可见面**：`cluster_status` 新增 `host` 段（`verdict` / `sessionEvents.via` / `version` 或「未取得」/ 声明支持区间），`render` 显示一行 `宿主 <verdict> · 会话读取 <via> · 版本 <v|未取得>`。
+
+**边界诚实**：
+
+- 「支持区间」是**声明**不是保证——`SUPPORTED_HOSTS` 里 `tested: '推断'` 的条目**没有实测过**，不得当作已支持。
+- 版本号**常常取不到**（本插件目前无**已实证**的版本源）⇒ `version: ''` 是**正常结果**、不是故障；**判定不依赖它**。
+
 ## 6. 边界与信任
 
 - **能力边界 ≠ 沙箱**：总线是普通目录；插件不提供也**不承诺**隔离。同机任意进程可读写总线文件。
@@ -322,6 +357,15 @@ cd self-plugins/dsh-agent-cluster && node scripts/peer-demo.mjs
 | B8 | 跨机消息**真的过网络**（不是文件旁路），且拒绝面有对照 | §5.9 | **已实测**（2026-09-22） | ✔ `tests/transport.test.mjs` 起**真 `node:http` 监听**（`port: 0` 取真实端口），`pushToPeer` 推 → 对端 `onInbound` 收到正文与来源 id（**对照组**）；同测内三组拒绝各就其位：错密钥 `401` · 非成员 `403` · 未开入站 `503`，且**被拒正文未进投递**（`received.length` 未增） |
 | B9 | **默认关闭时行为与加网络前相同** | §5.9 规则 1 | **已实测**（2026-09-22） | ✔ `listenPort: 0` 不启动监听（`cluster_members` 报 `listening:false`）；出站策略在**网络之前**拦截不合规地址——spy 断言 `fetch` 调用数 **= 0**（`plaintext-http-to-non-loopback` / `no-secret` 两条路径各验一次） |
 
+> **C 表（v0.4，宿主兼容 · §5.10）**——回答「**装到别人家能不能跑**」的可证伪判据：
+
+| # | 命题 | 对应 | 状态 | 证据 |
+|---|---|---|---|---|
+| C1 | 三个世代的会话形状都被正确读取：0.1.6（只有 `snapshotEvents`）/ 0.1.2-rc.1（只有 `events` 属性）/ 两者皆无 ⇒ 各走对路径，**且都不抛** | §5.10 规则 1/3 | **单测已验** | ✔ U：`tests/host-compat.test.mjs` 21 例——两个**真实世代尸体样本**各走对路径（互为对照组）、两条都在时方法优先、抛错 / 非数组 / 抛错 getter / `null` / 原始值全部安全退化；`npm test` **94/94 exit=0** |
+| C2 | `cluster_status` **现算**（不读缓存）并显示宿主兼容面：判定 / 读取路径 / 版本或「未取得」/ 声明支持区间 | §5.10 可见面 | **已实测**（2026-09-22） | ✔ E：重启后实调 `cluster_status` → `宿主 supported · 会话读取 snapshotEvents · 版本 未取得（走 snapshotEvents()（上游已标 deprecated）…；宿主版本未取得（无已实证的版本源）——判定不依赖它）` |
+| C3 | 版本号取不到时**判定不受影响**，且**绝不**采信 `npm_package_version`（那是本插件自己的版本） | §5.10 边界诚实 | **单测已验** | ✔ U：`readVersion({npm_package_version:'0.2.0'})` → `{version:'', source:'unknown'}`（采信它 = 报出一个**自信的错数**）；同测断言此时 `verdict` 仍为 `supported` 且理由里带「未取得」 |
+| C4 | 判定为 `degraded` 时**响**（落轨迹 + 日志），且 `no-sessions-yet` **不**告警（告警疲劳会让真降级没人看） | §5.10 ⚠ 响亮 | **部分已验** | ✔ U：判定层区分「全盲 ⇒ degraded」与「无样本 ⇒ degraded 但理由是时机」；⚠ **轨迹去重（`hostCompatTraced` 只落一次）与线上降级样本尚未取得**——当前宿主是 `supported`，无降级可观测 |
+
 ## 8. 与实现的关系
 
 - 主实现：`self-plugins/dsh-agent-cluster/src/`（host-only，无 client 面）+ `scripts/ref-node.mjs`（参考适配器，独立进程，非插件代码）。
@@ -347,6 +391,9 @@ cd self-plugins/dsh-agent-cluster && node scripts/peer-demo.mjs
 | 2026-09-15 | 闭环 | **U10（陈旧节点清理）落地**：判据从「年龄/保留期」改成「**血统 + 判活**」——因此不需要保留期参数，也不会误删他人的节点。**U6（节点 id 退化）随之缓解**：身份稳定回 `web-0`，收件箱不再每次重启漂移（`takeOverInbox` 保留为改名路径的兜底）。**同时订正一条认知**：这不是「显示层该去重」的问题——工作台画的是总线真身，**数据不真，界面不可能真**；修在源头，界面自动变干净（实测星图 5 星 → 2 星，无需改前端一行） |
 | 2026-09-19 | **上游适配**（本条 2026-09-22 复核补记） | DSH 0.1.6 **移除 `Session.events` 公共属性** ⇒ 投递侧会话枚举（`sessionLite()`）改读 `s.snapshotEvents()`，并把「非数组归空」的归一搬进 try/catch（会话未装载仍不抛——2026-09-14 宿主被杀事故的防线不得因适配而丢）。⚠ 两点如实记录：① 该改动**至今仍在工作区未提交**（`git status: M src/index.ts`），但**已构建进 `lib/index.js`（2026-09-20 11:49）并随重启生效**（判据：产物内含 `snapshotEvents` + 运行中节点心跳在案）；② 上游同时把 `snapshotEvents()` 标为 **deprecated（新调用被禁）** ⇒ 本次是恢复功能的**临时适配**，长久方向是投影/显式观察（见 U12） |
 | 2026-09-22 | **复核回写（D3 驱动）** | `semantic_check` D3 报「实现比文档新」（impl `src/index.ts` 2026-09-19 > doc 2026-09-15）。复核结论 = **真过时**：上一条适配落在本插件自己的语义范围（投递侧会话枚举），而文档里**没有痕迹**。回写：① §5.2 补「会话历史的读取路径」注（含 deprecated 警示）；② §7 新增 **A14**；③ §10 新增 **U12**。**副产物（值得记住）**：本条的 D3 触发者不是已提交历史，而是**未提交的工作区改动**（文件 mtime 会进 impl 比对）⇒ D3 也会对「在建改动」报警，复核时必须人工分辨「已落地 / 在建」——本次两手都记（产物已生效、源码待提交） |
+| 2026-09-22 | **提交（清 U12 ①）** | 跨版本读事件改动落库：`10eec5a`（`snapshotEvents()` 优先，回退 `events` 属性，8 增 5 删）。此前它「**已构建生效但未提交**」——而未提交意味着回滚/checkout 会丢掉它，后果是**静默退化**。判据：`npm run build` exit=0 + `npm test` **73/73** exit=0（提交时读数） |
+| 2026-09-22 | **新增能力面（v0.4 · 宿主兼容）** | **能力探测优先于版本号**。触发来自主人的交付物定义：「**安装了这个插件的智能体，都可以接入到这个智能体网络当中**」⇒ 插件必须能装进**别人的 DSH**，版本由对方决定（上游 `dsh-tavern` 锁 `0.1.2-rc.1`，比我本机旧）。新增 `src/host-compat.ts`（`pickCallable` / `readSessionEvents` / `probeServices` / `probeHostCompat` / `describeCompat` / `SUPPORTED_HOSTS`，纯模块）· `sessionLite()` 改用它（**探测单源**——不再各处手写 `typeof` 判断，两份必然漂移）· `cluster_status` 增 `host` 段与 `hostLine` · 轨迹 `host-compat` / `host-degraded`（同描述只落一次）。**核心认知**：`inject` 只保证「**服务在**」，保证不了「**服务上的 API 还在**」——服务存在性交给激活门，API 形状交给探测 |
+| 2026-09-22 | **修正（两条坑，都值得记住）** | ① **值 schema 的嵌套对象必须显式声明 `additionalProperties`**：给 `cluster_status` 加 `host` 对象后 tsc 报 `Property 'additionalProperties' is missing in type ... but required in type 'ObjectValueSchemaSpec'`（顶层写了、嵌套没写 ⇒ 报在嵌套那一层）。② **一条仪器错**：我先用 `node --test tests/`，Node 24 把 `tests/` 当**模块**加载 → `Cannot find module ...\tests` + `fail 1`，**看起来像代码坏了**；真入口是 `npm test` → `node --test "tests/*.test.mjs"`（换真入口后 73/73 全绿）。教训：**读数必须连同「用的哪条命令」一起报**——「73/73」只有配上入口才是可复现的证据 |
 
 ## 10. 未决问题
 
@@ -361,4 +408,5 @@ cd self-plugins/dsh-agent-cluster && node scripts/peer-demo.mjs
 - **U9 台账滞后容忍度**（v0.2）：I8 的代价是台账状态滞后一个主脑处理周期。若主人希望「点开任务即见实时进度」，需要引入**执行侧只读侧车**（如 `logs/actions/` 已承担）或让节点回更频繁的 `progress` 事件——取舍待实测（先看 P2 跑起来后主人是否真的需要实时进度）。
 - **U10 陈旧节点清理**（v0.2）→ **已在 v0.3 闭环**（见 §9 与 I12）：判据改为「血统 + 判活」，启动即清扫自己的死前身；实测 `nodes/` 19 → 4。**残余**：`mailbox/` 的 23 个历史目录未清（**故意**——里面有已归档消息 = 审计价值；且空目录清理需要 `bus.ts` 侧的新原语）。若将来要清，**只清完全空的目录**。**别人的死节点**（`demo-worker`/`sim-node-a`）仍按设计保留：它们不是我的血统，由各自所有者负责（或将来引入归档区）。
 - **U11 宿主插件与预设边界的错配**（v0.2 实测）：`dsh-agent-cluster` 与 `dsh-agent-telegram` 都挂在**宿主组合**（web profile，`plugin_list` 实测 `挂载: web`）⇒ **所有预设**（含 `worker-base`）都会拿到它们。前者正合需要（节点自动有网络身份，无需预设挂载）；后者违反 spec §4.2「执行节点不挂 telegram」与 **P2-5「无直达主人通道」**——**预设层面无法移除宿主提供的插件**（预设只能「增加」本会话贡献的行，收不回宿主的）。候选修法：① 把 telegram 下移到主脑预设 `alice-v2`（需主会话在场 + 重启；注意 inbound 长轮询是宿主级长期连接，下移后仅主脑预设会话收信）；② 保留宿主，但在派发层用「节点不可用该工具」的**约定 + 审计**替代结构性隔离（弱保证，需明说）。**更一般的未决**：这条边界该沉淀为 harness 的组合纪律——「哪些能力属于宿主（全进程共享）、哪些属于预设（按会话收窄）」，以及**收窄型需求**（默认给、特定预设不给）在现行两平面模型下有没有一等表达。
-- **U12 DSH 0.1.6 会话读取适配的三件未了（2026-09-22 复核新增）**：① **未提交**——`src/index.ts` 的 `snapshotEvents()` 适配仍在工作区（`git status: M`）；虽已构建进 `lib/` 并线上生效，但未提交意味着**回滚/checkout 会丢掉它**，而丢掉的后果是**静默退化**（`s.events` 取不到 ⇒ 会话历史恒为空 ⇒ 目标裁决退化成「无最近活跃」，不报错、只变笨）；② **落在 deprecated API 上**——上游 `snapshotEvents()` / `eventAt()` / `ownEvents()` 已 `@deprecated … new calls are prohibited`，本次只是「既有逻辑的延续」；长久方向是改读投影或 `SessionObservation.events` + cursor（DSH 仓 note `2026-09-09-deprecate-synchronous-session-event-reads`）；③ **端到端投递复验**——A1/A2/A5 的 E2E 证据取自 2026-09-14/09-15（DSH 0.1.6 之前），适配后只做到源码/构建级判据（A14），**尚无一次新的真实投递样本**。倾向：先提交（清 ①）→ 再补一次双节点真实投递验收（清 ③）→ 迁移到投影（清 ②）。
+- **U12 DSH 0.1.6 会话读取适配的三件未了（2026-09-22 复核新增）**：① **未提交 → 已清（2026-09-22，提交 `10eec5a`）**——且顺手升级为「两个 API 都试」的**跨版本读**（见 §5.10）；② **落在 deprecated API 上**——上游 `snapshotEvents()` / `eventAt()` / `ownEvents()` 已 `@deprecated … new calls are prohibited`，本次只是「既有逻辑的延续」；长久方向是改读投影或 `SessionObservation.events` + cursor（DSH 仓 note `2026-09-09-deprecate-synchronous-session-event-reads`）；③ **端到端投递复验**——A1/A2/A5 的 E2E 证据取自 2026-09-14/09-15（DSH 0.1.6 之前），适配后只做到源码/构建级判据（A14），**尚无一次新的真实投递样本**。进展：**① 已清**（`10eec5a`）；余下 ③（补一次真实投递验收，与 U13 合办）与 ②（迁移到投影，须先确认目标宿主确有投影 API——否则会把兼容性又写死回单版本）。
+- **U13「装到别人家」的端到端尚未验证（2026-09-22 新增）**：宿主兼容层目前只做到**离线单测 + 本机 0.1.6 宿主实测**（C1/C2）。`SUPPORTED_HOSTS` 里 `0.1.2-rc.1` 那条标的是**推断**——本插件**尚未真的装进上游 `dsh-tavern` 实例**并跑通一次投递。清它需要三步：① 把插件装进酒馆 profile（落点 `profiles/tavern/cordis.patch.yml`；⚠ **不要进 `dshTavern.managedBundles`**——不进那一份才能在酒馆自己更新时被保留）；② 两端点起一次**真实投递**（不是同机双端口那种近似）；③ 把读数回填 C1/C2，并把该条从 `推断` 升为 `实测`。**在清掉之前，不许把「可安装」说成已达成**——`SUPPORTED_HOSTS` 的 `tested` 字段就是这条纪律的机器可读形式。

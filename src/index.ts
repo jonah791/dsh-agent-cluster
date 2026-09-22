@@ -40,7 +40,11 @@ import {
   attemptCount, defaultState, isHandled, loadState, markHandled, noteFailure, readyToRetry,
   serializeState, type NodeState,
 } from './state.ts'
-import { decideTarget, type SessionLite } from './target.ts'
+import { decideTarget, type SessionEventLite, type SessionLite } from './target.ts'
+// 宿主兼容（`docs/semantic.md` §5.10）：本插件是**可安装**产物，装到谁的机器上、对方的 DSH
+// 是什么版本，由对方决定。`inject` 只保证「服务在」，保证不了「服务上的 API 还在」
+// （`Session.events` 就是这么丢的）——API 形状一律**探测**，不假设。
+import { describeCompat, probeHostCompat, probeServices, readSessionEvents, type HostCompat } from './host-compat.ts'
 // 跨机承载（`docs/members.md` §5）：传输适配器 + 自开端点 + 成员册。
 // 这一层是对 §6「不做网络」的**有意修订**——纪律是默认关闭 + fail-closed。
 import { parseMemberRecord, type MemberRecord } from './transport.ts'
@@ -443,30 +447,60 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // ── 投递（接收侧）──
+  /** 宿主兼容探针的最近一次结果（`cluster_status` 显示用）；`null` = 还没探过。 */
+  let hostCompat: HostCompat | null = null
+  let hostCompatTraced = ''
+
+  /** 现算宿主兼容（不给会话样本就现取）。探测**不抛**——它跑在投递链路里，抛异常会杀宿主。 */
+  const compatNow = (sessionsIn?: readonly unknown[]): HostCompat => {
+    let sessions = sessionsIn
+    if (sessions === undefined) {
+      try {
+        sessions = ctx.sessions.list()
+      } catch (e) {
+        trace('sessions-unavailable', { error: String(e) })
+        sessions = []
+      }
+    }
+    return probeHostCompat(sessions, { env: process.env, services: probeServices(ctx) })
+  }
+
+  /**
+   * 记录宿主兼容状态：**只在有话可说时落轨迹**，且同一描述只落一次。
+   * `no-sessions-yet` 不落——那是**时机**不是故障，为它告警会造成告警疲劳（真降级就没人看了）。
+   */
+  const noteCompat = (sessions: readonly unknown[]): void => {
+    try {
+      const c = compatNow(sessions)
+      hostCompat = c
+      if (c.sampled === 0) return
+      const line = describeCompat(c)
+      if (line === hostCompatTraced) return
+      hostCompatTraced = line
+      trace(c.verdict === 'supported' ? 'host-compat' : 'host-' + c.verdict, {
+        verdict: c.verdict, sessionEvents: c.sessionEvents, sampled: c.sampled,
+        blind: c.blindSessions, fellBack: c.fellBackSessions,
+        version: c.version, versionSource: c.versionSource, reasons: c.reasons,
+      })
+      if (c.verdict !== 'supported') logger.warn('宿主兼容性降级：' + line)
+    } catch (e) {
+      trace('host-compat-error', { error: String(e) })
+    }
+  }
+
   const sessionLite = (): SessionLite[] => {
     try {
-      return ctx.sessions.list().map((s) => {
-        // **跨版本读事件**——本插件可能被装进**别的 DSH 发行版**，版本由对方决定：
-        //  · DSH 0.1.6+：`Session.events` 公共属性已移除（同步读 Session 历史全线弃用，见
-        //    .agents/notes/implemented/architecture/2026-09-09-deprecate-synchronous-session-event-reads.md），
-        //    改用同语义的 `snapshotEvents()`；
-        //  · DSH 0.1.2-rc.1（上游 dsh-tavern 锁定的版本）**没有** `snapshotEvents`，只有 `events` 属性。
-        // ⇒ 两个都试、谁在就用谁。只写单一版本的插件，装到对方宿主上会**静默退化**成「无候选会话」。
-        // （历史事故：直接读 `.length` → TypeError，异常从定时器逃逸杀死宿主 web 进程。）
-        let events: SessionLite['events'] = []
-        try {
-          const probe = s as { snapshotEvents?: () => unknown; events?: unknown }
-          const raw = typeof probe.snapshotEvents === 'function' ? probe.snapshotEvents() : probe.events
-          if (Array.isArray(raw)) events = raw as unknown as SessionLite['events']
-        } catch {
-          // 归一为空数组：会话尚未装载时保持「无候选会话」语义
-        }
-        return {
-          id: String(s.id),
-          delegationDepth: Number(s.header?.delegationDepth ?? 0),
-          events,
-        }
-      })
+      const list = ctx.sessions.list()
+      // 跨版本读事件：0.1.6+ 走 `snapshotEvents()`，0.1.2-rc.1（上游 dsh-tavern 锁定的版本）
+      // 只有 `events` 属性。探测实现**单源**在 `host-compat.ts`——判定与读取共用同一份，
+      // 两处各写一份必然漂移（本插件已经有「一份实现散在多处」的教训）。
+      const reads = list.map((s) => readSessionEvents<SessionEventLite>(s))
+      noteCompat(list)
+      return list.map((s, i) => ({
+        id: String(s.id),
+        delegationDepth: Number(s.header?.delegationDepth ?? 0),
+        events: reads[i]?.events ?? [],
+      }))
     } catch (e) {
       // cordis 严格代理下 ctx.sessions 访问可能抛错（dsh-agent-plugin-manager 同款已知现象）；
       // 退化为「无候选会话」→ 投递走 no-target 分支退避重试——绝不让异常逃逸出定时器。
@@ -653,6 +687,25 @@ export function apply(ctx: Context, config: Config): void {
           lastPollAgeMs: { type: 'number' },
           lastDeliveredAgeMs: { type: 'number' },
           recent: { type: 'array', items: { type: 'string' } },
+          // 宿主兼容（§5.10）：本插件是「可安装」产物，装到别人家是什么情况必须一眼看得到。
+          host: {
+            type: 'object',
+            // ⚠ 值 schema 的**嵌套对象必须显式声明 additionalProperties**（缺了 tsc 直接报
+            // `Property 'additionalProperties' is missing ... but required in type 'ObjectValueSchemaSpec'`）。
+            additionalProperties: false,
+            properties: {
+              verdict: { type: 'string' },
+              sessionEvents: { type: 'string' },
+              sampled: { type: 'number' },
+              blindSessions: { type: 'number' },
+              fellBackSessions: { type: 'number' },
+              version: { type: 'string' },
+              versionSource: { type: 'string' },
+              supported: { type: 'array', items: { type: 'string' } },
+              reasons: { type: 'array', items: { type: 'string' } },
+            },
+          },
+          hostLine: { type: 'string' },
           error: { type: 'string' },
         },
       },
@@ -662,13 +715,17 @@ export function apply(ctx: Context, config: Config): void {
         const bus = String(v['busDir'])
         const counts = '发 ' + String(v['sent']) + ' · 收 ' + String(v['delivered']) + ' · 待投 ' + String(v['pending']) + ' · 失败 ' + String(v['failed']) + ' · 死信 ' + String(v['dead'])
         const recent = Array.isArray(v['recent']) ? (v['recent'] as string[]).map((x) => '  · ' + x).join('\n') : ''
-        return [{ type: 'text', text: '本节点 ' + id + role + '  在线邻居 ' + String(v['onlineNeighbors']) + '/' + String(v['totalNodes']) + '\n总线 ' + bus + '\n' + counts + (String(v['error'] ?? '') !== '' ? '\n异常：' + String(v['error']) : '') + (recent !== '' ? '\n最近：\n' + recent : '') }]
+        const host = String(v['hostLine'] ?? '')
+        return [{ type: 'text', text: '本节点 ' + id + role + '  在线邻居 ' + String(v['onlineNeighbors']) + '/' + String(v['totalNodes']) + '\n总线 ' + bus + (host !== '' ? '\n' + host : '') + '\n' + counts + (String(v['error'] ?? '') !== '' ? '\n异常：' + String(v['error']) : '') + (recent !== '' ? '\n最近：\n' + recent : '') }]
       },
     },
     async execute() {
       const now = Date.now()
       const all = roster(true)
       const recent = tailTrace(paths.traceFile, 6).map((e) => String(e['phase'] ?? '?') + ' ' + String(e['node'] ?? '?') + (typeof e['id'] === 'string' ? ' ' + e['id'] : '')).reverse()
+      // 现算而非读缓存：这条工具要回答的是「**此刻**这台宿主什么情况」——读缓存会让
+      // 「刚装进去」与「跑了一小时」显示同一结果（读数必须自带时间域）。
+      const compat = compatNow()
       return {
         ok: true,
         nodeId,
@@ -685,6 +742,18 @@ export function apply(ctx: Context, config: Config): void {
         corrupt: state.counters.corrupt,
         sent: state.counters.sent,
         recent: recent.length > 0 ? recent : ['（尚无轨迹）'],
+        host: {
+          verdict: compat.verdict,
+          sessionEvents: compat.sessionEvents,
+          sampled: compat.sampled,
+          blindSessions: compat.blindSessions,
+          fellBackSessions: compat.fellBackSessions,
+          version: compat.version,
+          versionSource: compat.versionSource,
+          supported: compat.hosts.map((h) => h.dsh + '（' + h.tested + '）'),
+          reasons: compat.reasons,
+        },
+        hostLine: describeCompat(compat),
         // 可选键一律条件展开：DSH 的 output 校验要求 lossless JSON，**undefined 值会被拒**
         // （2026-09-14 线上实测：`cluster_status` 返回 undefined 字段 → "value is not lossless JSON"）
         ...(state.lastPollAtMs > 0 ? { lastPollAgeMs: now - state.lastPollAtMs } : {}),
