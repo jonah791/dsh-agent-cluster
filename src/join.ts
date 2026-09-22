@@ -14,7 +14,7 @@
  * inside the host process, where an escaping exception kills the web daemon (§5.24).
  */
 import { JOIN_PATH, type PostJsonResult } from './http-node.ts'
-import { decideJoin, describeInvite, mintInvite, parseInvite, redactToken, type InvitePayload } from './invite.ts'
+import { decideJoin, describeInvite, mintInvite, OPEN_INVITE_MEMBER, parseInvite, redactToken, type InvitePayload } from './invite.ts'
 import { parseMemberRecord, type MemberRecord } from './transport.ts'
 
 /** Injected IO + facts. Nothing here reaches for globals — tests supply their own. */
@@ -81,15 +81,27 @@ export function createJoinHandler(deps: JoinDeps): JoinHandler {
     const m = mintInvite({ net: deps.network, url: base, host: deps.nodeId, member: input.member, nowMs: now(), ttlMs: ttl || (deps.defaultTtlMs ?? DAY_MS) })
     if (!m.ok || m.invite === undefined) throw new Error('令牌生成失败：' + m.detail)
     const inv: InvitePayload = m.invite
-    // **签发即准入**：准入决定在这里做完，不留给入网方自选身份。
-    const rec: MemberRecord = {
-      memberId: inv.member, kind: 'peer', trust: 'known', capabilities: [], protocol: 'v1',
-      secret: inv.secret, notes: '已签发邀请令牌 ' + new Date(now()).toISOString().slice(0, 10),
+    // **签发即准入**：绑定令牌此刻就把该成员写进册子（准入决定不留给入网方自选身份）。
+    // ⚠ 开放令牌（`member: '*'`）**不写**——此时还没有具体成员可入册（身份是入网时才自报的），
+    // 而且 `*` 在 Windows 上根本不是合法文件名（2026-09-22 被 join-demo 抓住的真缺陷：
+    // 写册子失败 ⇒ 签发直接抛错，而症状看起来像「令牌生成失败」）。
+    if (inv.member !== OPEN_INVITE_MEMBER) {
+      const rec: MemberRecord = {
+        memberId: inv.member, kind: 'peer', trust: 'known', capabilities: [], protocol: 'v1',
+        secret: inv.secret, notes: '已签发邀请令牌 ' + new Date(now()).toISOString().slice(0, 10),
+      }
+      const w = deps.writeMember(rec)
+      if (!w.ok) throw new Error('成员册写入失败：' + (w.error ?? ''))
     }
-    const w = deps.writeMember(rec)
-    if (!w.ok) throw new Error('成员册写入失败：' + (w.error ?? ''))
-    deps.trace('invite-minted', { member: inv.member, net: inv.net, exp: inv.exp, base })
+    deps.trace('invite-minted', { member: inv.member, net: inv.net, exp: inv.exp, base, open: inv.member === OPEN_INVITE_MEMBER })
     const loopback = base.startsWith('http://127.0.0.1') || base.startsWith('http://localhost')
+    const warnings: string[] = []
+    if (inv.member === OPEN_INVITE_MEMBER) {
+      warnings.push('**开放令牌**：谁拿到谁能进，且身份由入网方自报——只交给可信对象，且用短有效期')
+    }
+    if (loopback) {
+      warnings.push('基址是回环地址——只有**同一台机器**上的实例能用这张令牌；跨机邀请要用对方能访问到的地址重签（url 参数）')
+    }
     return {
       ok: true,
       member: inv.member,
@@ -97,7 +109,7 @@ export function createJoinHandler(deps: JoinDeps): JoinHandler {
       joinUrl: base + JOIN_PATH,
       expiresAt: new Date(inv.exp).toISOString(),
       inviteLine: describeInvite(inv),
-      ...(loopback ? { warning: '基址是回环地址——只有**同一台机器**上的实例能用这张令牌；跨机邀请要用对方能访问到的地址重签（url 参数）' } : {}),
+      ...(warnings.length > 0 ? { warning: warnings.join('；') } : {}),
     }
   }
 
@@ -130,23 +142,30 @@ export function createJoinHandler(deps: JoinDeps): JoinHandler {
       deps.trace('join-reject', { reason: decision.reason, detail: decision.detail, member: inv.member })
       return { status: 403, body: { ok: false, reason: decision.reason, detail: decision.detail } }
     }
+    // 开放令牌（`member: '*'`）：身份由入网方自报 ⇒ **必须真的自报了**才准入，
+    // 否则不知道要写进册子的 id 是什么（宁可拒，也不许凭空造一个身份）。
+    const admittedId = inv.member === OPEN_INVITE_MEMBER ? (claimant?.memberId ?? '') : inv.member
+    if (admittedId === '') {
+      deps.trace('join-reject', { reason: 'missing-claimant', detail: '开放令牌要求入网方自报成员记录' })
+      return { status: 400, body: { ok: false, reason: 'missing-claimant', detail: '开放令牌要求入网方在请求里带 member.memberId（身份自报）' } }
+    }
     const rec: MemberRecord = {
-      memberId: inv.member,
+      memberId: admittedId,
       kind: 'peer',
       trust: 'known',
       capabilities: claimant?.capabilities ?? [],
       protocol: 'v1',
       ...(claimant?.endpoint !== undefined ? { endpoint: claimant.endpoint } : {}),
       secret: inv.secret,
-      notes: '通过邀请令牌入网 ' + new Date(now()).toISOString().slice(0, 10),
+      notes: (inv.member === OPEN_INVITE_MEMBER ? '开放邀请令牌入网（身份自报）' : '通过邀请令牌入网') + ' ' + new Date(now()).toISOString().slice(0, 10),
     }
     const w = deps.writeMember(rec)
     if (!w.ok) {
-      deps.trace('join-write-failed', { member: inv.member, error: w.error ?? '' })
+      deps.trace('join-write-failed', { member: admittedId, error: w.error ?? '' })
       return { status: 500, body: { ok: false, reason: 'member-write-failed', detail: w.error ?? '' } }
     }
     deps.markNonceUsed(inv.nonce)
-    deps.trace('join-admitted', { member: inv.member, net: inv.net, nonce: inv.nonce })
+    deps.trace('join-admitted', { member: admittedId, net: inv.net, nonce: inv.nonce, open: inv.member === OPEN_INVITE_MEMBER })
     return { status: 200, body: { ok: true, net: deps.network, host: JSON.parse(JSON.stringify(deps.selfRecord())) as unknown } }
   }
 

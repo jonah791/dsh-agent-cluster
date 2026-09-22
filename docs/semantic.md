@@ -335,7 +335,7 @@ payload = { v:1, net, url, host, member, secret, exp, nonce }
 
 **工具面**：
 
-- `cluster_invite`（主脑侧）：为一个成员 id 签发令牌——**签发即准入**（同时写 `members/<id>.json`）。
+- `cluster_invite`（主脑侧）：为一个成员 id 签发令牌——**签发即准入**（同时写 `members/<id>.json`）。传 `member: '*'` 则签发**开放令牌**（谁拿到谁能进、身份由入网方自报）：此时**不**在签发时入册（还没有具体成员），准入发生在入网那一刻，且风险由工具输出**明写**、不藏在文档里。为什么要它：主人要的是「装上插件的智能体**都可以**接入」，而绑定式要求邀请方**先知道对方节点 id** = 鸡生蛋。
 - `cluster_join <token>`（入网方）：解析 → 校验（`expectMember` = 本节点 id）→ 把入网请求推到 `url` → 取回主脑的成员记录写进自己的册子 ⇒ **双方互相入册**。
 
 **端点**：`POST /cluster/join`（与 `/cluster/inbox` 并列）。⚠ 它**不用 HMAC 认证**——入网方此时**还没有**密钥（这正是令牌存在的理由），**令牌自己就是凭证**。fail-closed：缺令牌 / 指纹不符 / 过期 / 网络不符 / 重放 / 身份不符 ⇒ 一律拒，并落 `join-reject` 轨迹（**带理由**，可回答「为什么没进去」）。
@@ -408,6 +408,16 @@ payload = { v:1, net, url, host, member, secret, exp, nonce }
 | C3 | 版本号取不到时**判定不受影响**，且**绝不**采信 `npm_package_version`（那是本插件自己的版本） | §5.10 边界诚实 | **单测已验** | ✔ U：`readVersion({npm_package_version:'0.2.0'})` → `{version:'', source:'unknown'}`（采信它 = 报出一个**自信的错数**）；同测断言此时 `verdict` 仍为 `supported` 且理由里带「未取得」 |
 | C4 | 判定为 `degraded` 时**响**（落轨迹 + 日志），且 `no-sessions-yet` **不**告警（告警疲劳会让真降级没人看） | §5.10 ⚠ 响亮 | **部分已验** | ✔ U：判定层区分「全盲 ⇒ degraded」与「无样本 ⇒ degraded 但理由是时机」；⚠ **轨迹去重（`hostCompatTraced` 只落一次）与线上降级样本尚未取得**——当前宿主是 `supported`，无降级可观测 |
 
+> **D 表（v0.5，入网凭证 · §5.11）**——回答「**陌生人拿一张令牌就能进来吗，而且只进到他该在的地方**」：
+
+| # | 命题 | 对应 | 状态 | 证据 |
+|---|---|---|---|---|
+| D1 | 令牌端到端可用：签发 → 对方解析 → 推入网请求 → 主脑准入 → **双方互相入册**，且两边记的是**同一把专属密钥**（≠ 网络共享密钥） | §5.11 | **已实测**（2026-09-22） | ✔ `node scripts/join-demo.mjs` → **23/23 exit=0**（真 `node:http` 监听 + 真 `createJoinHandler`，与线上同一份代码，不是第二实现）；对照组含「签发即准入」「两边密钥一致且 ≠ 网络共享密钥」「令牌描述不回显密钥」 |
+| D2 | 六类拒绝各就其位且**理由可诊断**：重放 `replay` / 篡改（指纹或载荷）/ 过期 `expired`（理由带到期 ISO 时刻）/ 串网 `not-my-network` / 冒名 `member-mismatch` / 入网方本地拦 `wrong-member` | §5.11 | **已实测**（2026-09-22） | ✔ 同 demo，原文取证：`{"ok":false,"reason":"expired","detail":"令牌已过期（到期 2026-09-21T07:53:53.091Z）"}` · `{"reason":"member-mismatch","detail":"令牌准入 guest-2，但请求者自报 冒名者"}` · `{"reason":"replay","detail":"该令牌已被使用过（nonce dc5f916cc598a95b）"}` · 本地拒：`令牌不可用（wrong-member）：这张令牌准入的是 someone-else，不是本节点 guest-1` |
+| D3 | 拒绝**不留副作用**：不写成员文件、不消耗 nonce；密钥不出现在任何可打印描述里 | §5.11 边界诚实 | **已实测**（2026-09-22） | ✔ 同 demo：`拒绝路径不留成员文件` ✔ · `被拒令牌后已用 nonce 仍为 1` ✔ · `inviteLine` 中不含密钥 ✔ |
+| D4 | 在本机真实宿主里 `cluster_invite` / `cluster_join` 两个工具可用（schema 真能被加载并执行） | §5.11 工具面 | **待线上验收** | ⚠ 待验收：工具已接线、类型与离线判据全过，但**尚未重启加载后实调一次**——`output.schema` 类缺陷只在真实装载时暴露（同族事故见 §9 的 nested `additionalProperties` 一条） |
+| D5 | **开放令牌**（`member: '*'`）可用：陌生实例自报身份即可入网；未自报则拒（`missing-claimant`，**不凭空造身份**）；且网络/期限/重放三条约束**照旧生效** | §5.11 | **已实测**（2026-09-22） | ✔ demo 第 [4] 组：`陌生实例凭开放令牌入网（身份自报）` ✔ · `册子里写的是自报身份` ✔ · `没自报身份 → 400 missing-claimant` ✔ · 单测另断言开放令牌**仍**受 `not-my-network` / `expired` / `replay` 约束，且**绑定令牌**的行为不因它而松动（互为对照） |
+
 ## 8. 与实现的关系
 
 - 主实现：`self-plugins/dsh-agent-cluster/src/`（host-only，无 client 面）+ `scripts/ref-node.mjs`（参考适配器，独立进程，非插件代码）。
@@ -436,6 +446,9 @@ payload = { v:1, net, url, host, member, secret, exp, nonce }
 | 2026-09-22 | **提交（清 U12 ①）** | 跨版本读事件改动落库：`10eec5a`（`snapshotEvents()` 优先，回退 `events` 属性，8 增 5 删）。此前它「**已构建生效但未提交**」——而未提交意味着回滚/checkout 会丢掉它，后果是**静默退化**。判据：`npm run build` exit=0 + `npm test` **73/73** exit=0（提交时读数） |
 | 2026-09-22 | **新增能力面（v0.4 · 宿主兼容）** | **能力探测优先于版本号**。触发来自主人的交付物定义：「**安装了这个插件的智能体，都可以接入到这个智能体网络当中**」⇒ 插件必须能装进**别人的 DSH**，版本由对方决定（上游 `dsh-tavern` 锁 `0.1.2-rc.1`，比我本机旧）。新增 `src/host-compat.ts`（`pickCallable` / `readSessionEvents` / `probeServices` / `probeHostCompat` / `describeCompat` / `SUPPORTED_HOSTS`，纯模块）· `sessionLite()` 改用它（**探测单源**——不再各处手写 `typeof` 判断，两份必然漂移）· `cluster_status` 增 `host` 段与 `hostLine` · 轨迹 `host-compat` / `host-degraded`（同描述只落一次）。**核心认知**：`inject` 只保证「**服务在**」，保证不了「**服务上的 API 还在**」——服务存在性交给激活门，API 形状交给探测 |
 | 2026-09-22 | **修正（两条坑，都值得记住）** | ① **值 schema 的嵌套对象必须显式声明 `additionalProperties`**：给 `cluster_status` 加 `host` 对象后 tsc 报 `Property 'additionalProperties' is missing in type ... but required in type 'ObjectValueSchemaSpec'`（顶层写了、嵌套没写 ⇒ 报在嵌套那一层）。② **一条仪器错**：我先用 `node --test tests/`，Node 24 把 `tests/` 当**模块**加载 → `Cannot find module ...\tests` + `fail 1`，**看起来像代码坏了**；真入口是 `npm test` → `node --test "tests/*.test.mjs"`（换真入口后 73/73 全绿）。教训：**读数必须连同「用的哪条命令」一起报**——「73/73」只有配上入口才是可复现的证据 |
+| 2026-09-22 | **新增能力面（v0.5 · 入网凭证）** | **令牌 = 一次入网的完整凭据**（主人把交付物定义为「装了这个插件的智能体都能接入网络」⇒ 入网必须对方**一步**做完，且**不必知道我的 `busDir`**）。新增 `src/invite.ts`（mint / parse / decide / describe / redact，纯模块 **never throws**）· `src/join.ts`（`createJoinHandler` → handleJoin 主脑裁决 / mintInviteFor **签发即准入** / joinNetwork 入网方）· 端点 `POST /cluster/join`（**唯一未认证入口**——令牌自己就是凭证）· 工具 `cluster_invite` / `cluster_join` · `config.network` · `MemberRecord.secret`（成员**专属**密钥，缺席回退共享密钥；`decideInbound` 与 `cluster_peer` 真的用它，否则令牌里的密钥只是装饰）。四条设计判断见 §5.11 |
+| 2026-09-22 | **可跑证据抓到的真缺陷（值得记）** | 加「开放令牌」时，demo 第 [4] 组**第一拍就崩**：`member: '*'` 被当成成员 id 去写册子，而 **`*` 在 Windows 上不是合法文件名** ⇒ 写失败 ⇒ 签发抛错，症状却看起来像「令牌生成失败」。**真因是设计错位**：开放令牌在签发时**根本没有具体成员可入册**（身份是入网时才自报的）——准入应当发生在 join 那一刻。修法：绑定令牌才「签发即准入」，开放令牌只登记令牌本身；并补一条判据「开放令牌**不**在签发时造成员」。教训：**可跑证据的价值不在于确认已知的能跑，而在于让「还没想清楚的边界」当场暴露**——这条如果只写单测（纯函数、不碰文件系统）根本抓不到 |
+| 2026-09-22 | **重构（为可测性 · 同日本能反思）** | 入网裁决原**内联在 `apply` 闭包**里 ⇒ 只能靠假 ctx 测，而它恰是**唯一一条未认证入口**、最需要可跑证据。抽成 `src/join.ts` 后，`scripts/join-demo.mjs` 能用**真 `node:http` + 真裁决函数**（与线上同一份代码，不是第二实现）驱动全流程 ⇒ **18/18 exit=0**。顺带修 `PostJsonResult`：失败分支也要带 `body`——服务端的错误正文才是诊断，原来只把它拼进 `reason` 标签，于是「服务端说明了原因，调用方只看到一个状态码」 |
 
 ## 10. 未决问题
 
@@ -452,3 +465,4 @@ payload = { v:1, net, url, host, member, secret, exp, nonce }
 - **U11 宿主插件与预设边界的错配**（v0.2 实测）：`dsh-agent-cluster` 与 `dsh-agent-telegram` 都挂在**宿主组合**（web profile，`plugin_list` 实测 `挂载: web`）⇒ **所有预设**（含 `worker-base`）都会拿到它们。前者正合需要（节点自动有网络身份，无需预设挂载）；后者违反 spec §4.2「执行节点不挂 telegram」与 **P2-5「无直达主人通道」**——**预设层面无法移除宿主提供的插件**（预设只能「增加」本会话贡献的行，收不回宿主的）。候选修法：① 把 telegram 下移到主脑预设 `alice-v2`（需主会话在场 + 重启；注意 inbound 长轮询是宿主级长期连接，下移后仅主脑预设会话收信）；② 保留宿主，但在派发层用「节点不可用该工具」的**约定 + 审计**替代结构性隔离（弱保证，需明说）。**更一般的未决**：这条边界该沉淀为 harness 的组合纪律——「哪些能力属于宿主（全进程共享）、哪些属于预设（按会话收窄）」，以及**收窄型需求**（默认给、特定预设不给）在现行两平面模型下有没有一等表达。
 - **U12 DSH 0.1.6 会话读取适配的三件未了（2026-09-22 复核新增）**：① **未提交 → 已清（2026-09-22，提交 `10eec5a`）**——且顺手升级为「两个 API 都试」的**跨版本读**（见 §5.10）；② **落在 deprecated API 上**——上游 `snapshotEvents()` / `eventAt()` / `ownEvents()` 已 `@deprecated … new calls are prohibited`，本次只是「既有逻辑的延续」；长久方向是改读投影或 `SessionObservation.events` + cursor（DSH 仓 note `2026-09-09-deprecate-synchronous-session-event-reads`）；③ **端到端投递复验**——A1/A2/A5 的 E2E 证据取自 2026-09-14/09-15（DSH 0.1.6 之前），适配后只做到源码/构建级判据（A14），**尚无一次新的真实投递样本**。进展：**① 已清**（`10eec5a`）；余下 ③（补一次真实投递验收，与 U13 合办）与 ②（迁移到投影，须先确认目标宿主确有投影 API——否则会把兼容性又写死回单版本）。
 - **U13「装到别人家」的端到端尚未验证（2026-09-22 新增）**：宿主兼容层目前只做到**离线单测 + 本机 0.1.6 宿主实测**（C1/C2）。`SUPPORTED_HOSTS` 里 `0.1.2-rc.1` 那条标的是**推断**——本插件**尚未真的装进上游 `dsh-tavern` 实例**并跑通一次投递。清它需要三步：① 把插件装进酒馆 profile（落点 `profiles/tavern/cordis.patch.yml`；⚠ **不要进 `dshTavern.managedBundles`**——不进那一份才能在酒馆自己更新时被保留）；② 两端点起一次**真实投递**（不是同机双端口那种近似）；③ 把读数回填 C1/C2，并把该条从 `推断` 升为 `实测`。**在清掉之前，不许把「可安装」说成已达成**——`SUPPORTED_HOSTS` 的 `tested` 字段就是这条纪律的机器可读形式。
+- **U14 入网令牌的吊销与已用记录清理（2026-09-22 新增）**：三个已知缺口，都**如实列出而不是假装没有**：① **没有吊销**——令牌一旦签发，在到期前一直有效（签发时已写成员册，但**撤回**要手工删 `members/<id>.json`，且**不会通知对方**）；② `join-used.json` 的 nonce **上限 500 条、滚动丢弃最旧** ⇒ 极旧的令牌理论上在窗口外可重放（窗口长度取决于入网频率）；③ 令牌是**持有者凭证**，这一点无法用密码学消除，只能靠「期限 + 一次性 + 单一身份绑定」把窗口收窄。倾向：先按现状跑，等出现**真实**需求再做吊销列表与清理——不为想象的需求加机制（与 U9 同一条纪律）。

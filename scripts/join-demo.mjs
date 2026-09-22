@@ -147,6 +147,19 @@ try {
   check('被拒令牌的 nonce **未**被消耗（不存在的那张）', usedNonces.length === 1, '已用 nonce 数 = ' + String(usedNonces.length))
   check('令牌解析器对畸形输入不抛', (() => { try { parseInvite('dshc1.@@@.###', { nowMs: Date.now() }); return true } catch { return false } })())
 
+  console.log('\n[4] 开放令牌（member=*）：给「还不知道对方节点 id」的场景')
+  const openMinted = hostJoins.mintInviteFor({ member: '*' })
+  check('开放令牌在输出里**明写风险**（不藏在文档里）', /开放令牌/.test(String(openMinted.warning ?? '')), String(openMinted.warning))
+  check('开放令牌**不**在签发时造成员（此刻还没有具体成员，准入发生在入网那一刻）', hostStore.has('*') === false)
+  const stranger = await postJoin(hostBase + JOIN_PATH, {
+    token: openMinted.token,
+    member: { memberId: 'stranger-9', trust: 'known', capabilities: ['cluster'], endpoint: 'http://127.0.0.1:4100' },
+  })
+  check('陌生实例凭开放令牌入网（身份自报）', stranger.r.status === 200 && stranger.body?.ok === true, JSON.stringify(stranger.body))
+  check('册子里写的是**自报**身份', hostStore.has('stranger-9'))
+  const anon = await postJoin(hostBase + JOIN_PATH, { token: hostJoins.mintInviteFor({ member: '*' }).token, member: null })
+  check('开放令牌但**没自报**身份 → 拒（missing-claimant），不凭空造身份', anon.r.status === 400 && anon.body?.reason === 'missing-claimant', JSON.stringify(anon.body))
+
   console.log('\n结果：' + String(pass) + ' 通过 / ' + String(fail) + ' 失败')
 } finally {
   if (node !== undefined) await node.close()

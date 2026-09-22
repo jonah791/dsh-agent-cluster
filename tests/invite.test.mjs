@@ -9,6 +9,7 @@ import assert from 'node:assert/strict'
 import {
   DEFAULT_INVITE_TTL_MS,
   INVITE_PREFIX,
+  OPEN_INVITE_MEMBER,
   canonicalInviteJson,
   decideJoin,
   describeInvite,
@@ -181,6 +182,28 @@ test('解析面绝不抛：喂一组敌意输入仍然返回结构完整的结�
     assert.equal(typeof r.reason, 'string')
     assert.ok(r.detail.length > 0, '失败必须带 detail')
   }
+})
+
+test('开放令牌（member=*）：身份自报，但仍受网络/期限/重放约束；绑定令牌照旧拦「不是我」', () => {
+  const open = mintInvite({ net: 'alice-net', url: 'http://127.0.0.1:1', host: 'host-0', member: OPEN_INVITE_MEMBER, nowMs: NOW })
+  const r = parseInvite(open.token, { nowMs: NOW, expectMember: '任何自报身份' })
+  assert.equal(r.ok, true, '开放令牌不该被「不是我」拦住')
+  assert.match(r.detail, /开放令牌/)
+  // 开放 ≠ 无约束：网络、期限、重放三条照旧
+  assert.equal(decideJoin(open.invite, { net: '别的网络', nowMs: NOW }).reason, 'not-my-network')
+  assert.equal(decideJoin(open.invite, { net: 'alice-net', nowMs: NOW + DEFAULT_INVITE_TTL_MS + 1 }).reason, 'expired')
+  assert.equal(decideJoin(open.invite, { net: 'alice-net', nowMs: NOW, seenNonce: () => true }).reason, 'replay')
+  assert.equal(decideJoin(open.invite, { net: 'alice-net', nowMs: NOW }).admit, true, '对照组：干净条件下应当准入')
+  // 对照：绑定令牌的行为不因开放令牌的存在而松动
+  const bound = mintInvite({ net: 'alice-net', url: 'http://127.0.0.1:1', host: 'host-0', member: 'guest-1', nowMs: NOW })
+  assert.equal(parseInvite(bound.token, { nowMs: NOW, expectMember: 'me-0' }).reason, 'wrong-member')
+  assert.equal(decideJoin(bound.invite, { net: 'alice-net', nowMs: NOW, expectedMember: '冒名者' }).reason, 'member-mismatch')
+})
+
+test('开放令牌的成员名可以签发，但**不该**悄悄改变绑定令牌的语义（mint 侧不擅自替换）', () => {
+  const open = mintInvite({ net: 'n', url: 'http://127.0.0.1:1', host: 'h', member: OPEN_INVITE_MEMBER, nowMs: NOW })
+  assert.equal(open.ok, true)
+  assert.equal(open.invite.member, OPEN_INVITE_MEMBER, '签发侧必须原样保留，不许自作主张换成别的 id')
 })
 
 test('同一载荷生成同一指纹（指纹必须可复现，否则「传输损坏」与「内容改动」分不开）', () => {

@@ -29,6 +29,17 @@ export const INVITE_PREFIX = 'dshc1'
 /** Default lifetime: a day is long enough to pass a token along, short enough to expire. */
 export const DEFAULT_INVITE_TTL_MS = 24 * 60 * 60 * 1000
 
+/**
+ * 开放令牌的 `member` 取值：**谁拿到谁能进**，成员身份由入网方自报。
+ *
+ * 为什么允许它存在：交付要求是「装了这个插件的智能体**都可以**接入」——而绑定式令牌要求
+ * 邀请方**事先知道**对方的节点 id，对陌生人是一道没必要的摩擦（鸡生蛋）。
+ *
+ * ⚠ 代价必须说清，不许含糊：① 令牌泄露 ⇒ **任何持有者**都能以**任意自报身份**加入；
+ * ② 身份不再由邀请方指定。所以开放令牌要**显式选择**，且在工具输出与文档里明写风险。
+ */
+export const OPEN_INVITE_MEMBER = '*'
+
 /** Fingerprint length in hex chars (64 bits) — enough for corruption, not a signature. */
 const FP_CHARS = 16
 
@@ -168,10 +179,17 @@ export function parseInvite(token: unknown, opts: { nowMs: number; expectMember?
   if (opts.nowMs > 0 && invite.exp <= opts.nowMs) {
     return { ok: false, reason: 'expired', detail: '令牌已过期（到期 ' + new Date(invite.exp).toISOString() + '）' }
   }
-  if (opts.expectMember !== undefined && invite.member !== opts.expectMember) {
+  if (invite.member !== OPEN_INVITE_MEMBER && opts.expectMember !== undefined && invite.member !== opts.expectMember) {
     return { ok: false, reason: 'wrong-member', detail: '这张令牌准入的是 ' + invite.member + '，不是本节点 ' + opts.expectMember }
   }
-  return { ok: true, reason: 'ok', invite, detail: '令牌有效：网络 ' + invite.net + ' · 准入身份 ' + invite.member }
+  return {
+    ok: true,
+    reason: 'ok',
+    invite,
+    detail: invite.member === OPEN_INVITE_MEMBER
+      ? '令牌有效（**开放令牌**）：网络 ' + invite.net + ' · 身份由入网方自报'
+      : '令牌有效：网络 ' + invite.net + ' · 准入身份 ' + invite.member,
+  }
 }
 
 export type JoinReason = 'ok' | 'not-my-network' | 'expired' | 'replay' | 'member-mismatch'
@@ -198,7 +216,7 @@ export function decideJoin(
   if (invite.exp <= host.nowMs) {
     return { admit: false, reason: 'expired', detail: '令牌已过期（到期 ' + new Date(invite.exp).toISOString() + '）' }
   }
-  if (host.expectedMember !== undefined && invite.member !== host.expectedMember) {
+  if (invite.member !== OPEN_INVITE_MEMBER && host.expectedMember !== undefined && invite.member !== host.expectedMember) {
     return { admit: false, reason: 'member-mismatch', detail: '令牌准入 ' + invite.member + '，但请求者自报 ' + host.expectedMember }
   }
   if (host.seenNonce !== undefined && host.seenNonce(invite.nonce)) {

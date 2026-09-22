@@ -1178,7 +1178,7 @@ export function apply(ctx: Context, config: Config): void {
     name: 'cluster_invite',
     description: '签发一张「入网令牌」给某个智能体——它一步就能接入本网络（**不需要知道我的总线目录**）。令牌里带网络名、我的入站地址、该成员**专属**密钥与到期时间。签发即准入（同时写进成员册）。⚠ 令牌是凭据：只该经可信渠道交给对方，不要公开发。',
     parameters: {
-      member: { type: 'string', required: true, description: '被邀请者的成员 id（一张令牌只准入这一个 id）' },
+      member: { type: 'string', required: true, description: '被邀请者的成员 id（一张令牌只准入这一个 id）；传 * = **开放令牌**：谁拿到谁能进、身份由入网方自报' },
       ttlMinutes: { type: 'number', description: '有效期（分钟，缺省 1440 = 24 小时）' },
       url: { type: 'string', description: '我的入站基址覆盖（缺省 http://127.0.0.1:<listenPort>）；跨机邀请必须填对方能访问到的地址' },
     },
