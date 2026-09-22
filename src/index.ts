@@ -446,14 +446,17 @@ export function apply(ctx: Context, config: Config): void {
   const sessionLite = (): SessionLite[] => {
     try {
       return ctx.sessions.list().map((s) => {
-        // DSH 0.1.6 适配：`Session.events` 公共属性已移除 —— 同步读取 Session 历史
-        // 已全线弃用（见 .agents/notes/implemented/architecture/
-        // 2026-09-09-deprecate-synchronous-session-event-reads.md）。改用同语义的
-        // snapshotEvents()；仍保留归一，防会话未装载时抛错。
+        // **跨版本读事件**——本插件可能被装进**别的 DSH 发行版**，版本由对方决定：
+        //  · DSH 0.1.6+：`Session.events` 公共属性已移除（同步读 Session 历史全线弃用，见
+        //    .agents/notes/implemented/architecture/2026-09-09-deprecate-synchronous-session-event-reads.md），
+        //    改用同语义的 `snapshotEvents()`；
+        //  · DSH 0.1.2-rc.1（上游 dsh-tavern 锁定的版本）**没有** `snapshotEvents`，只有 `events` 属性。
+        // ⇒ 两个都试、谁在就用谁。只写单一版本的插件，装到对方宿主上会**静默退化**成「无候选会话」。
         // （历史事故：直接读 `.length` → TypeError，异常从定时器逃逸杀死宿主 web 进程。）
         let events: SessionLite['events'] = []
         try {
-          const raw = s.snapshotEvents()
+          const probe = s as { snapshotEvents?: () => unknown; events?: unknown }
+          const raw = typeof probe.snapshotEvents === 'function' ? probe.snapshotEvents() : probe.events
           if (Array.isArray(raw)) events = raw as unknown as SessionLite['events']
         } catch {
           // 归一为空数组：会话尚未装载时保持「无候选会话」语义
