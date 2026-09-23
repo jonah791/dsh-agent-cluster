@@ -8,7 +8,7 @@ import assert from 'node:assert/strict'
 import { DEFAULT_ANCHOR_STALE_MS, decideTarget, isUserSession, lastRealUserPromptAt } from '../lib/target.js'
 
 const u = (time) => ({ type: 'user/message', time, data: { source: { kind: 'user' } } })
-const pluginMsg = (time) => ({ type: 'user/message', time, data: { source: { kind: 'plugin' } } })
+const pluginMsg = (time) => ({ type: 'user/message', time, data: { source: { kind: 'dsh-agent-cluster' } } })
 const otherEvent = (time) => ({ type: 'assistant/message', time, data: {} })
 const sess = (id, events, delegationDepth = 0) => ({ id, delegationDepth, events })
 
