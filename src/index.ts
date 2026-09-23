@@ -33,6 +33,10 @@ import {
   ageText, deriveNodeId, nodeOnline, parseHeartbeat, resolveCollision, sanitizeId, shouldReap, type Heartbeat,
 } from './identity.ts'
 import {
+  canLead, decideLeader, describeLeader, grantLease, normalizeKind, parseLease, renewIntervalMs,
+  type LeaderCandidate, type LeaderLease,
+} from './leader.ts'
+import {
   DEFAULT_MAX_TEXT_CHARS, injectionText, isExpired, makeMessage, parseMessage, MESSAGE_KINDS,
   type MessageKind,
 } from './protocol.ts'
@@ -52,6 +56,12 @@ import { JOIN_PATH, memberDirOf, postJson, pushToPeer, readMembersFromDisk, star
 // 入网（§5.11）：令牌 = 一次入网的完整凭据（地址 + 该成员专属密钥 + 已裁决的准入）。
 // 交付形态是「可安装」⇒ 入网必须对方**一步**做完，且**不需要知道我的 busDir**。
 import { createJoinHandler } from './join.ts'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-agent-cluster': { kind: 'dsh-agent-cluster' }
+  }
+}
 
 /** 插件名（Loader 用）。 */
 export const name = 'agent-cluster'
@@ -105,6 +115,19 @@ export interface Config {
   secret: string
   /** 网络名（§5.11）：令牌带着它，防止一张令牌被用去另一个网络（`not-my-network`）。 */
   network: string
+  /** 本节点端类型（`server`/`desktop`/`phone`/`watch`/`glasses`）；空 = `unknown`。主脑资格按它判定。 */
+  nodeKind: string
+  /** 是否参与主脑选举（手表/眼镜等省电端可置 false）。 */
+  leaderEligible: boolean
+  /** 主脑租约存活期（ms）；续租间隔 = TTL/3（缺省 90s / 30s，见 `docs/design.md` §15.1）。 */
+  leaderLeaseTtlMs: number
+  /**
+   * 是否**自动续租**（缺省 `false` = 显式配置才开，与「加网络层要显式配置」同一纪律）。
+   *
+   * 关闭时主脑只是**一次性任期**：TTL 一过租约失效、需再次 `claim`。
+   * 打开后本节点在任期内每 TTL/3 续租一次，主脑才成为**持续角色**（设计 §15.1 的原意）。
+   */
+  leaderAutoRenew: boolean
 }
 
 /** 配置 schema（默认值即本机单机可用值）。 */
@@ -129,6 +152,10 @@ export const Config = z.object({
   allowInbound: z.boolean().default(false),
   secret: z.string().default(''),
   network: z.string().default('dsh-cluster'),
+  nodeKind: z.string().default(''),
+  leaderEligible: z.boolean().default(true),
+  leaderLeaseTtlMs: z.number().default(90_000),
+  leaderAutoRenew: z.boolean().default(false),
 })
 
 /** 运行时探测结果（进程环境事实，不是配置）。 */
@@ -348,6 +375,12 @@ export function apply(ctx: Context, config: Config): void {
       startedAt,
       atMs: Date.now(),
       tags: config.tags,
+      // 本构建实现了租约协议（`src/leader.ts`）⇒ 自报能力。**能力要自报，不靠别人猜**：
+      // 缺这个字段的节点（老版本 / 别的应用里的旧构建）在选举里按「不具备」处理。
+      leaderCapable: true,
+      // 端类型也要自报，否则「手表/眼镜端默认不合格」这条判据在真实总线上是死的
+      // （未声明一律 unknown = 桌面级 ⇒ 手表也会参选）。空配置 = 不写这个字段（老行为）。
+      ...(config.nodeKind.trim() === '' ? {} : { kind: normalizeKind(config.nodeKind) }),
     }
     const r = atomicWriteJson(heartbeatFile, hb, nonce())
     if (!r.ok) logger.error('心跳写入失败：' + String(r.error))
@@ -659,7 +692,7 @@ export function apply(ctx: Context, config: Config): void {
     try {
       agent.steer(createUserMessage({
         content: [{ type: 'text', text: injectionText(msg) }],
-        source: { kind: 'plugin', plugin: 'dsh-agent-cluster' },
+        source: { kind: 'dsh-agent-cluster' },
       }))
     } catch (e) {
       state = noteFailure(state, msg.id, nowMs)
@@ -737,6 +770,183 @@ export function apply(ctx: Context, config: Config): void {
     removeIfExists(heartbeatFile)
     trace('unload', {})
   }, 'agent-cluster.timers()')
+
+  // ── 主脑（leader）──
+  // 判据与选举在 `src/leader.ts`（纯函数 + 24 条单测）；本段只做 IO 与工具面。
+  // 租约布局 `state/primary-lease-<epoch>.json`——**按 epoch 分文件**，让 `publishNoClobber`
+  // 的 no-clobber 语义天然表达「同一 epoch 只许一个赢家」（`docs/design.md` §15.1 第 2 条）。
+  // 读侧取最大 epoch；坏文件跳过（选举不因坏文件停摆）。
+
+  /** 读总线上的最新主脑租约。 */
+  const readLeaderLease = (): LeaderLease | null => {
+    let best: LeaderLease | null = null
+    for (const f of listJsonFiles(paths.stateDir)) {
+      if (!f.startsWith('primary-lease-')) continue
+      const raw = readJsonValue(join(paths.stateDir, f))
+      if (!raw.ok) continue
+      const parsed = parseLease(raw.value)
+      if (parsed === null) continue
+      if (best === null || parsed.epoch > best.epoch) best = parsed
+    }
+    return best
+  }
+
+  /**
+   * 从名册构造选举候选。
+   * ⚠ 心跳目前**不带** kind / trust / leaderEligible ⇒ 缺声明一律按 `unknown` / `known` / 可参选。
+   * 即「手表端不合格」这类判据要生效，得先让心跳带上端类型声明（见 `docs/design.md` §15.1.1 已知边界）。
+   */
+  const leaderCandidates = (nowMs: number): LeaderCandidate[] => {
+    const out: LeaderCandidate[] = []
+    for (const f of listJsonFiles(paths.nodesDir)) {
+      const raw = readJsonValue(join(paths.nodesDir, f))
+      if (!raw.ok) continue
+      const hb = raw.value as Record<string, unknown>
+      const atMs = typeof hb['atMs'] === 'number' ? (hb['atMs'] as number) : 0
+      const ageMs = nowMs - atMs
+      out.push({
+        nodeId: typeof hb['nodeId'] === 'string' ? (hb['nodeId'] as string) : f.replace(/\.json$/, ''),
+        ageMs,
+        online: ageMs <= config.offlineAfterMs,
+        kind: normalizeKind(hb['kind']),
+        trust: typeof hb['trust'] === 'string' ? (hb['trust'] as string) : 'known',
+        leaderEligible: hb['leaderEligible'] !== false,
+        // 缺省（老版本节点不写这个字段）= **不具备**——能力要自报，不靠猜。
+        leaderCapable: hb['leaderCapable'] === true,
+      })
+    }
+    return out
+  }
+
+  /**
+   * 主脑动作的**唯一落盘路径**——工具面与自动续租共用它，不许两条路各写一次租约
+   * （同一纪律见本插件的「各路径共用装配器」判据：一个职责一个写者）。
+   *
+   * `take` 与 `renew` 的写盘语义**不同**，这是本函数存在的第二个理由：
+   * - **take** = 新建任期 ⇒ 用 `publishNoClobber`（原子 `link()`）表达「同一 epoch 只许一个赢家」；
+   * - **renew** = **同一个 epoch 换新的 `atMs`** ⇒ 必须**覆盖**。若续租也用 no-clobber，它会因文件已存在
+   *   而恒失败——租约到期、主脑消失。**no-clobber 只对抢占成立**，这一点不能混。
+   *
+   * @param nowMs - 本次裁决的时刻。
+   * @returns 结果说明 + 是否真的写了总线（供调用方决定要不要记轨迹）。
+   */
+  const applyLeaderDecision = (nowMs: number): { note: string; wrote: boolean } => {
+    const lease = readLeaderLease()
+    const decision = decideLeader({
+      self: nodeId, candidates: leaderCandidates(nowMs), lease, nowMs, ttlMs: config.leaderLeaseTtlMs,
+    })
+    if (decision.action === 'take') {
+      const dest = join(paths.stateDir, 'primary-lease-' + decision.epoch + '.json')
+      const r = publishNoClobber(
+        dest, grantLease(nodeId, decision.epoch, nowMs, config.leaderLeaseTtlMs),
+        'lease-' + decision.epoch + '-' + nodeId,
+      )
+      if (r.ok && !r.duplicate) {
+        appendTrace(paths.traceFile, { at: nowMs, phase: 'leader-take', nodeId, epoch: decision.epoch })
+        return { note: '已抢占 epoch ' + decision.epoch + ' → ' + dest, wrote: true }
+      }
+      return {
+        note: '抢占失败（' + (r.duplicate ? '同一 epoch 已被别人创建' : String(r.error)) + '）——本轮不重试',
+        wrote: false,
+      }
+    }
+    if (decision.action === 'renew') {
+      const dest = join(paths.stateDir, 'primary-lease-' + decision.epoch + '.json')
+      const r = atomicWriteJson(
+        dest, grantLease(nodeId, decision.epoch, nowMs, config.leaderLeaseTtlMs), nonce(),
+      )
+      if (r.ok) {
+        appendTrace(paths.traceFile, { at: nowMs, phase: 'leader-renew', nodeId, epoch: decision.epoch })
+        return {
+          note: '已续租 epoch ' + decision.epoch + '（TTL ' + String(Math.round(config.leaderLeaseTtlMs / 1000)) + 's）',
+          wrote: true,
+        }
+      }
+      return { note: '续租失败（' + String(r.error) + '）', wrote: false }
+    }
+    return { note: '未抢占（action=' + decision.action + '）——不写总线', wrote: false }
+  }
+
+  ctx.tools.register(defineTool({
+    name: 'cluster_leader',
+    description: '主脑（leader）：查看当前主脑与各候选资格，或以本节点身份抢占租约。主脑**可迁移**——租约（TTL 缺省 90s）过期后任何合格节点都能接管，epoch 单调递增防脑裂；看到更高 epoch 的节点自降为 worker。无主时点对点通信照常（主脑只提供协调，不是单点依赖）。',
+    parameters: {
+      action: { type: 'string', description: 'status=只读查看（缺省）；claim=以本节点身份抢占租约' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          line: { type: 'string', required: true },
+          action: { type: 'string', required: true },
+          leaderId: { type: 'string' },
+          epoch: { type: 'number', required: true },
+          self: { type: 'string', required: true },
+          kind: { type: 'string', required: true },
+          eligible: { type: 'boolean', required: true },
+          eligibility: { type: 'string', required: true },
+          candidates: { type: 'number', required: true },
+          online: { type: 'number', required: true },
+          claimed: { type: 'boolean' },
+          claimNote: { type: 'string' },
+        },
+      },
+      render: (_a: unknown, v: Record<string, unknown>) => {
+        const head = '本节点 ' + String(v['self']) + '（端 ' + String(v['kind']) + '）资格：' + String(v['eligibility'])
+        const roster = '候选 ' + String(v['candidates']) + ' 个（在线 ' + String(v['online']) + '）'
+        const claim = String(v['claimNote'] ?? '')
+        return [{ type: 'text', text: head + '\n' + String(v['line']) + '\n' + roster + (claim !== '' ? '\n' + claim : '') }]
+      },
+    },
+    async execute(args: { action?: string }) {
+      const nowMs = Date.now()
+      const lease = readLeaderLease()
+      const candidates = leaderCandidates(nowMs)
+      const decision = decideLeader({ self: nodeId, candidates, lease, nowMs, ttlMs: config.leaderLeaseTtlMs })
+      const selfCandidate = candidates.find((c) => c.nodeId === nodeId)
+      const eligibility = selfCandidate === undefined ? '不在总线名册（心跳尚未写出）' : canLead(selfCandidate).why
+      const base = {
+        ok: true,
+        line: describeLeader(decision, nowMs, lease),
+        action: decision.action,
+        ...(decision.leaderId === null ? {} : { leaderId: decision.leaderId }),
+        epoch: decision.epoch,
+        self: nodeId,
+        kind: normalizeKind(config.nodeKind),
+        eligible: selfCandidate !== undefined && canLead(selfCandidate).ok,
+        eligibility,
+        candidates: candidates.length,
+        online: candidates.filter((c) => c.online).length,
+      }
+      if ((args.action ?? 'status') !== 'claim') return base
+      const applied = applyLeaderDecision(nowMs)
+      return { ...base, claimed: applied.wrote, claimNote: applied.note }
+    },
+  }))
+
+  // ── 自动续租（**显式配置才开**，与「加网络层要显式配置」同一纪律）──
+  //
+  // 不自动续租时，主脑只是**一次性任期**：TTL（缺省 90s）一过租约就失效，需再次 `claim`
+  // ⇒ 那不算「网络有主脑」，只算「主脑闪现过」。设计 §15.1 本就写了「TTL 90s / 每 30s 续租」。
+  // 定时器由 fiber 拥有并可清理（§5.24：回调一律 guarded，绝不让异常逃逸出定时器）。
+  /** 一次自动续租尝试（逻辑与工具面共用 `applyLeaderDecision`，不另写一条写租约的路）。 */
+  const leaderTick = (): void => {
+    const r = applyLeaderDecision(Date.now())
+    if (r.wrote) trace('leader-auto', { note: r.note })
+  }
+  // ⚠ 形状有讲究：守卫契约测试**按行**断言 `setInterval(() => { guarded(`——回调体必须**恰好是一次 guarded 调用**，
+  // 不能把 guarded 埋进多行或三元表达式里（2026-09-23 实测被该契约抓过一次：契约是对的，改的是我的代码）。
+  const leaderTimer = config.leaderAutoRenew
+    ? setInterval(() => { guarded('leader-auto', leaderTick) }, Math.max(5_000, renewIntervalMs(config.leaderLeaseTtlMs)))
+    : null
+  if (leaderTimer !== null) {
+    ctx.effect(() => () => { clearInterval(leaderTimer) })
+    logger.info('主脑自动续租已启用（每 %ds 一次，TTL %ds）',
+      Math.round(Math.max(5_000, renewIntervalMs(config.leaderLeaseTtlMs)) / 1000),
+      Math.round(config.leaderLeaseTtlMs / 1000))
+  }
 
   // ── 工具面 ──
   ctx.tools.register(defineTool({
