@@ -4,6 +4,10 @@
  * 不变量 I3（幂等）：同一 messageId 至多注入一次——靠 `handled` 滚动集合。
  * 不变量 I2 的重试账：`attempts[id]` 记尝试次数与下次可试时刻（有界退避，防止紧转轮）。
  * 状态文件损坏时**回落到默认状态**并报 `recovered`（不崩、不静默：调用方落痕）。
+ *
+ * ⚠ **`attempts` 只记「可恢复的失败」**（对照 `miss.ts`）：结构性不可注入（无顶层用户会话）
+ * **不写进重试账**——否则无会话节点的消息会被重试到 `maxAttempts` 而进 `dead/`，
+ * 那正是适配器读不到它的原因。保持态改用独立的 `holdNoted` 簿记（只防刷屏，不决定归宿）。
  */
 
 /** 单条消息的重试账。 */
@@ -18,7 +22,13 @@ export interface NodeState {
   nodeId: string
   /** 已投递/已归档的消息 id（滚动上限 HANDLED_CAP）。 */
   handled: string[]
-  /** 未投递成功消息的重试账（id → 记录）。 */
+  /**
+   * 已就「结构性不可注入（无顶层用户会话）」落过痕的消息 id（滚动上限 HOLD_NOTED_CAP）。
+   * 用途单一：**防每轮刷屏**（无会话节点每次轮询都会走到这条分支）。
+   * 它**不参与投递归宿**——既不阻止后续成功投递，也不影响 TTL 兜底。
+   */
+  holdNoted: string[]
+  /** 未投递成功消息的重试账（id → 记录）。只装**可恢复**的失败。 */
   attempts: Record<string, AttemptRecord>
   counters: {
     sent: number
@@ -36,6 +46,8 @@ export interface NodeState {
 
 /** `handled` 滚动上限（防状态文件无限增长）。 */
 export const HANDLED_CAP = 500
+/** `holdNoted` 滚动上限（同上，独立簿记）。 */
+export const HOLD_NOTED_CAP = 200
 /** 重试退避上限（ms）：连续失败时最长等这么久再试。 */
 export const MAX_BACKOFF_MS = 30_000
 
@@ -45,6 +57,7 @@ export function defaultState(nodeId: string, nowMs: number): NodeState {
     v: 1,
     nodeId,
     handled: [],
+    holdNoted: [],
     attempts: {},
     counters: { sent: 0, broadcast: 0, delivered: 0, failed: 0, dead: 0, corrupt: 0, readErrors: 0 },
     lastPollAtMs: 0,
@@ -77,7 +90,12 @@ export function loadState(raw: unknown, nodeId: string, nowMs: number): LoadedSt
   if (o['nodeId'] !== nodeId) {
     return { state: defaultState(nodeId, nowMs), recovered: true, why: '状态归属不符（' + String(o['nodeId']) + '≠' + nodeId + '）' }
   }
-  const handled = Array.isArray(o['handled']) ? o['handled'].filter((x): x is string => typeof x === 'string').slice(-HANDLED_CAP) : []
+  const strs = (value: unknown, cap: number): string[] =>
+    Array.isArray(value) ? value.filter((x): x is string => typeof x === 'string').slice(-cap) : []
+  const handled = strs(o['handled'], HANDLED_CAP)
+  // 向后兼容：旧状态文件没有 `holdNoted` ⇒ 空数组。**字段缺失不是损坏**——
+  // 不得因此把整份状态判为 recovered（那会让每个老节点重启后凭空丢掉重试账）。
+  const holdNoted = strs(o['holdNoted'], HOLD_NOTED_CAP)
   const attempts: Record<string, AttemptRecord> = {}
   const rawAttempts = o['attempts']
   if (rawAttempts !== null && typeof rawAttempts === 'object' && !Array.isArray(rawAttempts)) {
@@ -96,6 +114,7 @@ export function loadState(raw: unknown, nodeId: string, nowMs: number): LoadedSt
     v: 1,
     nodeId,
     handled,
+    holdNoted,
     attempts,
     counters: {
       sent: num('sent'),
@@ -130,6 +149,7 @@ export function markHandled(state: NodeState, id: string, nowMs: number): NodeSt
   return {
     ...state,
     handled: handled.slice(-HANDLED_CAP),
+    holdNoted: state.holdNoted.filter((x) => x !== id),
     attempts: omit(state.attempts, id),
     updatedAt: nowMs,
   }
@@ -158,6 +178,21 @@ export function readyToRetry(state: NodeState, id: string, nowMs: number): boole
 /** 该消息已尝试次数。 */
 export function attemptCount(state: NodeState, id: string): number {
   return state.attempts[id]?.n ?? 0
+}
+
+/**
+ * 是否已就「结构性不可注入」给该消息落过痕。
+ * 用途单一：**防每轮刷屏**（无会话节点每次轮询都会走到这条分支）。
+ */
+export function isHoldNoted(state: NodeState, id: string): boolean {
+  return state.holdNoted.includes(id)
+}
+
+/** 记下「该消息处于无会话保持态」（滚动裁剪，返回新状态）。 */
+export function markHoldNoted(state: NodeState, id: string, nowMs: number): NodeState {
+  const holdNoted = state.holdNoted.filter((x) => x !== id)
+  holdNoted.push(id)
+  return { ...state, holdNoted: holdNoted.slice(-HOLD_NOTED_CAP), updatedAt: nowMs }
 }
 
 function omit(rec: Record<string, AttemptRecord>, key: string): Record<string, AttemptRecord> {

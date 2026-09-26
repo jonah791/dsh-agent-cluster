@@ -41,10 +41,13 @@ import {
   type MessageKind,
 } from './protocol.ts'
 import {
-  attemptCount, defaultState, isHandled, loadState, markHandled, noteFailure, readyToRetry,
-  serializeState, type NodeState,
+  attemptCount, defaultState, isHandled, isHoldNoted, loadState, markHandled, markHoldNoted,
+  noteFailure, readyToRetry, serializeState, type NodeState,
 } from './state.ts'
 import { decideTarget, type SessionEventLite, type SessionLite } from './target.ts'
+// 投递未成功的**语义分类**（`miss.ts`）：区分「还没到时候」（可恢复 ⇒ 消耗重试）与
+// 「这条路对我不可用」（结构性 ⇒ 保留原位）。2026-09-26 断点：无会话节点被当失败重试到 dead。
+import { classifyMiss, describeMiss, type MissReason } from './miss.ts'
 // 宿主兼容（`docs/semantic.md` §5.10）：本插件是**可安装**产物，装到谁的机器上、对方的 DSH
 // 是什么版本，由对方决定。`inject` 只保证「服务在」，保证不了「服务上的 API 还在」
 // （`Session.events` 就是这么丢的）——API 形状一律**探测**，不假设。
@@ -597,6 +600,13 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
+  /**
+   * 上一次会话探测是否**失败**（而非「探测成功但结果为空」）。
+   * ⚠ 这两者必须分开（对照 `miss.ts` 的模块注释）：把探测失败归入 structural，
+   * 等于把**宿主代理异常**静默成「本节点永久无会话」——故障被美化成特性。
+   */
+  let sessionsProbeFailed = false
+
   const sessionLite = (): SessionLite[] => {
     try {
       const list = ctx.sessions.list()
@@ -606,6 +616,7 @@ export function apply(ctx: Context, config: Config): void {
       // 那是未核实的假设且是错的（两个已知世代的会话读取面同形：都有 snapshotEvents()、
       // 都没有公开 events 属性）。凡形状断言要么标「推断」，要么当场取证。
       const reads = list.map((s) => readSessionEvents<SessionEventLite>(s))
+      sessionsProbeFailed = false
       noteCompat(list)
       return list.map((s, i) => ({
         id: String(s.id),
@@ -614,13 +625,31 @@ export function apply(ctx: Context, config: Config): void {
       }))
     } catch (e) {
       // cordis 严格代理下 ctx.sessions 访问可能抛错（dsh-agent-plugin-manager 同款已知现象）；
-      // 退化为「无候选会话」→ 投递走 no-target 分支退避重试——绝不让异常逃逸出定时器。
+      // 退化为「无候选会话」**并置探测失败位**——投递侧据此区分「没问到」与「没有」：
+      // 前者按退避重试（可恢复），后者保留原位（结构性）。绝不让异常逃逸出定时器。
+      sessionsProbeFailed = true
       trace('sessions-unavailable', { error: String(e) })
       return []
     }
   }
 
   const pendingFiles = (): string[] => listJsonFiles(inbox)
+
+  /**
+   * **可恢复失败**的统一出口：消耗重试 + 有界退避 + 落痕。
+   * 分类的真源在 `miss.ts`（`classifyMiss`），这里只负责记账与留痕——所有 retryable
+   * 分支都走这一条路，避免「同一语义在多处各写一份」（本插件已有的教训）。
+   * @param reason - 未成功的原因（与 `MissReason` 同域）
+   * @param id - 消息 id
+   * @param nowMs - 当前时刻
+   * @param extra - 附加落痕字段（sid / why / error 等）
+   */
+  const retryLater = (reason: MissReason, id: string, nowMs: number, extra: Record<string, unknown>): 'pending' => {
+    state = noteFailure(state, id, nowMs)
+    persist()
+    trace('deliver-retry', { id, reason, note: describeMiss(reason), ...extra })
+    return 'pending'
+  }
 
   const deliverOne = (fileName: string, nowMs: number): 'delivered' | 'pending' | 'dead' | 'skip' => {
     const path = join(inbox, fileName)
@@ -669,10 +698,26 @@ export function apply(ctx: Context, config: Config): void {
     }
     const decisionT = decideTarget(sessionLite(), config.mainSessionId !== '' ? config.mainSessionId : undefined, {})
     if (decisionT.sid === undefined) {
-      state = noteFailure(state, msg.id, nowMs)
-      persist()
-      trace('no-target', { id: msg.id, why: decisionT.why })
-      return 'pending'
+      // ⚠ 未成功的原因**必须分清**：「没问到」（探测失败）与「问到了，答案是没有」（无顶层会话）
+      // 是两回事——把前者归入结构性，等于把宿主代理异常静默成「本节点永久无会话」。
+      const reason: MissReason = sessionsProbeFailed ? 'sessions-unavailable' : 'no-target'
+      if (classifyMiss(reason) === 'structural') {
+        // 结构性不可注入：**不消耗重试**。重试不会让会话长出来，而判死会把消息移进 `dead/`
+        // —— 那正是 headless 适配器（直接读 mailbox 的消费者，对照 `scripts/ref-node.mjs`）
+        // 读不到它的原因：本该能工作的执行节点，被插件判死而结构性收不到活。
+        // 兜底是 TTL（`isExpired`）⇒ 不会无限堆积。
+        // 落痕只做一次：每轮都落会刷屏（2026-09-26 实测 48 条 no-target 只对应 3 条消息）。
+        if (!isHoldNoted(state, msg.id)) {
+          state = markHoldNoted(state, msg.id, nowMs)
+          persist()
+          trace('hold-no-session', {
+            id: msg.id, from: msg.from, kind: msg.kind, why: decisionT.why,
+            ttlAtMs: msg.createdAt + msg.ttlMs, note: describeMiss(reason),
+          })
+        }
+        return 'pending'
+      }
+      return retryLater(reason, msg.id, nowMs, { why: decisionT.why })
     }
     // 代理访问同样可能抛错：退化为 undefined → 走 no-agent 分支退避重试（不外抛）
     const agent = ((): ReturnType<typeof ctx.agents.get> => {
@@ -684,10 +729,7 @@ export function apply(ctx: Context, config: Config): void {
       }
     })()
     if (agent === undefined) {
-      state = noteFailure(state, msg.id, nowMs)
-      persist()
-      trace('no-agent', { id: msg.id, sid: decisionT.sid })
-      return 'pending'
+      return retryLater('no-agent', msg.id, nowMs, { sid: decisionT.sid })
     }
     try {
       agent.steer(createUserMessage({
@@ -695,10 +737,7 @@ export function apply(ctx: Context, config: Config): void {
         source: { kind: 'dsh-agent-cluster' },
       }))
     } catch (e) {
-      state = noteFailure(state, msg.id, nowMs)
-      persist()
-      trace('inject-error', { id: msg.id, sid: decisionT.sid, error: String(e) })
-      return 'pending'
+      return retryLater('inject-error', msg.id, nowMs, { sid: decisionT.sid, error: String(e) })
     }
     markHandledInPlace(msg.id, nowMs)
     state.counters.delivered += 1

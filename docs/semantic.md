@@ -45,6 +45,8 @@
 | **行为事件（action event）** | `logs/actions/<actionId>.jsonl` —— 结构性动作的**分阶段**落盘（每步一条），是「实时行为流」的数据源 |
 | **适配器（adapter）** | 让某种运行时成为节点的**中间层**（DSH 只是第一个）。职责：注册心跳 → 收任务 → 执行 → 回结果 → 落行为事件 |
 | **能力声明（capabilities）** | 节点心跳里的 `capabilities[]`——主脑**按能力寻址**（派活前先看节点会不会） |
+| **结构性不可注入（structural miss）** | 本节点**没有**可注入的顶层用户会话——不是「暂时没投成」，是「这条路对我不可用」。处置为**保持态**：消息保留在 inbox、不消耗重试、由 TTL 兜底（§5.12） |
+| **保持态（hold）** | 消息被刻意留在 inbox 等取用的状态。⚠ **与 `held` 不是一回事**：`held` 是**配置选择**（`autoInject=false`，留给 `cluster_inbox` 取用），保持态是**本节点结构性不可注入**。两者都留在 inbox，但理由与落痕不同（`held` vs `hold-no-session`） |
 
 ## 4. 概念模型与不变量
 
@@ -134,7 +136,7 @@
 | 心跳 | `index.ts` 定时器 | 每 `heartbeatMs` 重写自身心跳 |
 | 轮询 | `index.ts` 定时器 | 每 `pollIntervalMs` 扫描 `mailbox/<self>/` |
 | 注入 | `deliver()` | `ctx.agents.get(sid)` → `agent.steer(createUserMessage(...))` |
-| 目标裁决 | `deliver()` | 无用户会话/agent 未激活 → 保留原位 + 退避重试 |
+| 目标裁决 | `deliverOne()` | **两种语义分开**（§5.12）：**无顶层用户会话** ⇒ 结构性不可注入，消息保留原位、**不消耗重试**、落一次 `hold-no-session`；**会话探测失败** / agent 取不到 / 注入抛错 ⇒ 可恢复，按有界退避重试（统一走 `retryLater` 出口） |
 | 归档 | `deliver()` 成功后 | `mailbox/<self>/done/`，并 `state.markHandled(id)` |
 | 死信 | 重试耗尽/过期 | `mailbox/<self>/dead/` + 轨迹 |
 | 启动自检 | `apply()` | 立即心跳一次 + 投递积压（不依赖首个定时器 tick） |
@@ -350,6 +352,30 @@ payload = { v:1, net, url, host, member, secret, exp, nonce }
 - 「一次性」由主脑侧记录已用 `nonce` 实现；**未做**的是吊销列表与已用记录的自动清理（长期运行会缓慢增长，见 U14）。
 - **成员之间的互信仍是 v1 取舍**：专属密钥覆盖「该成员 ↔ 主脑」这条边；**成员与成员之间直连**（不经主脑）尚无共享密钥 ⇒ 要么各自互换令牌，要么继续走主脑。这条限制**必须对使用者明说**，不许含糊成「入网后大家都能互发」。
 
+### 5.12 投递未成功的语义分类（`src/miss.ts`）· 2026-09-26 新增
+
+**缺口（触发本节的实测断点）**：无会话节点（headless 执行节点）收到消息后走 `no-target` 分支，而该分支**消耗重试**（`noteFailure`）⇒ 20 次后消息进 `mailbox/<self>/dead/`。
+后果不是「投递慢」，是**适配器再也读不到它**——headless 消费者直接读 mailbox（对照 `scripts/ref-node.mjs`），而 `dead/` 是死信区。**本该能工作的执行节点，被插件判死而结构性收不到活。**
+
+**分类根据只有一条**：「这次没投成」是「**还没到时候**」，还是「**这条路对我不可用**」。
+
+| 原因（`MissReason`） | 语义 | 类别 | 处置 |
+|---|---|---|---|
+| `no-target` | 探测**成功**、结果为空：本节点无可注入的顶层用户会话 | `structural` | 消息**保留原位**、不消耗重试、落一次 `hold-no-session`；TTL 兜底 |
+| `sessions-unavailable` | 探测**失败**（宿主代理异常 / 会话面不可用） | `retryable` | 按有界退避重试 |
+| `no-agent` | 已选中目标但 `ctx.agents.get()` 取不到 | `retryable` | 同上 |
+| `inject-error` | `agent.steer()` 抛错 | `retryable` | 同上 |
+
+⚠ **`no-target` 与 `sessions-unavailable` 必须分开**（本模块最容易写错的一条）：前者是「问到了，答案是没有」，后者是「根本没问到」。把后者归入 `structural`，等于把**宿主代理异常**静默成「本节点永久无会话」——**故障被美化成特性**。因此 `sessionLite()` 新增**探测失败位**（`sessionsProbeFailed`），使这两件事在投递侧可分。
+
+**兜底与边界**：
+
+- `structural` **不等于永不判死**：TTL（`isExpired`）仍会把它归入 `dead/`，只是**不由「重试耗尽」触发**。
+- **落痕只做一次**（`state.ts` 的 `holdNoted` 簿记，滚动上限 200）：无会话节点每轮轮询都会走到这条分支，每轮都落会刷屏（2026-09-26 实测 **48** 条 `no-target` 只对应 **3** 条消息）。
+- **`holdNoted` 不参与投递归宿**：既不阻止后续成功投递，也不影响 TTL；投递成功后由 `markHandled` 清除。
+- **`attempts` 语义随之变窄**（只装可恢复的失败）：旧状态文件的 `attempts` 仍按原样读取，**字段缺失不判 `recovered`**（判 recovered 会让每个老节点重启后凭空丢掉重试账）。
+- **不制造第二条注入路径**（§5.9 规则 3）：本次只纠正**错误的处置**，注入仍只有 `agent.steer` 一条路；保持态消息的消费方是**适配器**（直接读 mailbox）或**会话出现后的正常投递**，不是新的注入实现。
+
 ## 6. 边界与信任
 
 - **能力边界 ≠ 沙箱**：总线是普通目录；插件不提供也**不承诺**隔离。同机任意进程可读写总线文件。
@@ -424,9 +450,19 @@ payload = { v:1, net, url, host, member, secret, exp, nonce }
 
 | C5 | 插件能**挂载并运行**在上游 `0.1.2-rc.1` 宿主里（启动 + 文件总线机制可用），但**会话事件读取路径的读数尚未取得** | §5.10 / U13 | **部分已实测**（2026-09-22） | ✔ 证据取自**共享总线轨迹**（跨节点可见，**不必驱动对方的 agent**）：`cluster-trace.jsonl` 里 `{"node":"LAPTOP-BF4IAPLM-tavern-3080","phase":"startup","busRoot":"C:\\Users\\tr\\.dsh-cluster","dirsOk":true}` 与 `{"phase":"startup-poll","scanned":0}`；配套结构证据（勘察分身逐条落盘）：`profiles/tavern/package.json` 的 `dependencies` 含 `"dsh-agent-cluster": "link:E:/alice/self-plugins/dsh-agent-cluster"`、`node_modules/dsh-agent-cluster` 是**真 link**、`cordis.patch.yml` 有 `insert` 行（id `agent-cluster`）、且 `dshTavern.managedBundles` **未**被污染（仍 6 项）。⚠ **未测到** `host-compat` 行——那次运行期间**没有会话**，而 `noteCompat` 按设计**不落** `no-sessions-yet`（防告警疲劳）⇒ **该宿主上没有运行期读数**；`SUPPORTED_HOSTS` 该条据此标为 **`静态`**。**2026-09-22 晚升为 `进程外运行期`**（不是 `实测`）：在进程外**执行**该宿主所带的真实产物——导入 `dsh-session@0.1.2-rc.1` 并枚举 `Session.prototype`（探针 `_tmp_review/probe-tavern-session-api.mjs`）⇒ `snapshotEvents` / `ownEvents` / `eventAt` / `seq` / `surface` **齐全**、**无**公开 `events` 属性 ⇒ 与 0.1.6 世代的会话读取面**运行期同形**（比「读源码」强，因为跑的是它实际装载的那份构建）。⚠ **`实测` 档仍未达**：该读数不在酒馆进程内，拿不到它自己算出的 verdict；进程内 `host-compat` 行的门槛依旧未过（见 U13）。**同时更正一条被写进 objective 的预期**：先前「预期会话读取 = `events-property`」源自那个未核实的假设，已被本读数**证伪**——真值是 `snapshotEvents` |**同日后续**：酒馆已被**起起来**并**修正身份**——旧心跳是 `-3080`，根因是酒馆启动器用 `{...process.env}` 透传了主 web 的 `DSH_WEB_URL=http://127.0.0.1:3080`，而插件的端口优先级里 **env 先于 argv**（`--port 3081` 其实传了，被抢）；修法 = 在 `cordis.patch.yml` 里**显式写 `port: 3081`**（配置层修，不动插件代码）⇒ 实测新心跳 `LAPTOP-BF4IAPLM-tavern-3081`（pid 31272、`baseUrl http://127.0.0.1:3081`），且**插件自己的血统清扫把旧的 `-3080` 心跳收掉了**（轨迹 `reap-lineage reaped:1 ids:["LAPTOP-BF4IAPLM-tavern-3080"]`）。⚠ 但**运行期 `host-compat` 读数仍缺**：它只在**有会话样本**时落，而酒馆当前无会话（`startup-poll scanned:0`）——造会话需 API Key + 导入人物卡，属**使用者自己的设置**（见 U13） |
 
+> **E 表（v0.6，投递语义分类 · §5.12）**——回答「**无会话节点还会不会被判死，故障会不会被伪装成特性**」：
+
+| # | 命题 | 对应 | 状态 | 证据 |
+|---|---|---|---|---|
+| E1 | `no-target` 归 `structural`、`sessions-unavailable` 归 `retryable`，且**两者必须分属不同类别**（语义不变量） | §5.12 | **单测已验** | ✔ U：`tests/miss.test.mjs` 7 条全绿。**三组尸体样本各就其位**（§5.9 规则 2）：① 把 `no-target` 改回 `retryable`（= 恢复断点行为）⇒ 5 pass / **2 fail**；② 把 `sessions-unavailable` 改成 `structural`（混淆「没问到」与「没有」）⇒ 5 pass / **2 fail**；③ 缺 `holdNoted` 字段判 `recovered` ⇒ 6 pass / **1 fail**。三组还原后全量 **157/157** exit=0 |
+| E2 | 结构性不可注入时**不消耗重试**；落痕**只做一次**；滚动上限生效 | §5.12 | **单测已验** | ✔ U：`tests/hold-noted.test.mjs` 7 条（`HOLD_NOTED_CAP` 裁剪保留最新、重复标记不产生重复项、`markHandled` 清除保持态、坏值归一化） |
+| E3 | 旧状态文件（无 `holdNoted`）⇒ 空数组且 `recovered=false`，**重试账完整保留** | §5.12 向后兼容 | **单测已验** | ✔ U：喂**老状态文件的真实形状**（v1 + `handled`/`attempts`/`counters`，无 `holdNoted`）⇒ `recovered=false` 且 `attempts['m-9'].n === 3` 保真。**尸体样本**：改判 `recovered` ⇒ 该条红 |
+| E4 | 线上：无会话节点收到消息后落 `hold-no-session`（而非 `no-target` 重试链），消息**留在 inbox 不被移入 `dead/`** | §5.12 | **待线上验收** | ⚠ 待线上验收。前置：① 重启 web 使新构建生效；② 一个**活着的无会话节点**（`tavern-3081` 是最现成候选——其 `startup-poll scanned:0` 已证无会话）。造样：向该节点 `cluster_send` 一条消息 → 读 `cluster-trace.jsonl` 的 phase 应为 `hold-no-session`，且 `mailbox/<该节点>/` 里该文件仍在 |
+
 ## 8. 与实现的关系
 
 - 主实现：`self-plugins/dsh-agent-cluster/src/`（host-only，无 client 面）+ `scripts/ref-node.mjs`（参考适配器，独立进程，非插件代码）。
+- **投递语义分类**（§5.12）：`src/miss.ts`（纯模块：`classifyMiss` / `describeMiss`，只做分类不做 IO）+ `src/state.ts` 的 `holdNoted` 簿记。分类结果的**消费点只有一个**：`index.ts` 的 `deliverOne()`；三种 `retryable` 分支统一走 `retryLater` 出口——避免「同一语义在多处各写一份」（本插件已有的教训）。
 - 语义主副本：本文件。`README.md` 面向使用者（安装/配置/用法），不复制语义。
 - 依赖：`ctx.tools`（工具面）、`ctx.agents`（投递）、`ctx.session`（用户会话枚举）。无对其他自研插件的 import（规则：不跨插件内部 import）。
 - 与 `dsh-agent-sentinel` 的关系：**同源规则、独立实现**——哨兵的 `wake-target.ts` 是「唤醒目标裁决」主副本，本插件的 `target.ts` 是「收件投递目标裁决」主副本；两者规则一致但不是同一份代码（跨插件 import 违规），差异需在各自「实践修订记录」里对齐。
@@ -460,6 +496,8 @@ payload = { v:1, net, url, host, member, secret, exp, nonce }
 | 2026-09-22 | **重构（为可测性 · 同日本能反思）** | 入网裁决原**内联在 `apply` 闭包**里 ⇒ 只能靠假 ctx 测，而它恰是**唯一一条未认证入口**、最需要可跑证据。抽成 `src/join.ts` 后，`scripts/join-demo.mjs` 能用**真 `node:http` + 真裁决函数**（与线上同一份代码，不是第二实现）驱动全流程 ⇒ **18/18 exit=0**。顺带修 `PostJsonResult`：失败分支也要带 `body`——服务端的错误正文才是诊断，原来只把它拼进 `reason` 标签，于是「服务端说明了原因，调用方只看到一个状态码」 |
 | 2026-09-22 | **证据阶梯扩为四档 + U13 的证据强一档（档次不变）** | 目标轮的 ② 要求「读到 `cluster_status` 的 host 段」。复核后**该宿主进程内读数仍取不到**，但取到了一种**更强的、此前无处安放**的证据：在进程外**执行**酒馆所带的真实产物（导入 `dsh-session@0.1.2-rc.1`，枚举 `Session.prototype`）⇒ `snapshotEvents` / `ownEvents` / `eventAt` / `seq` / `surface` 齐全、**无**公开 `events` 属性，与 0.1.6 世代**运行期同形**。**关键判断：不给它新开一档就会逼人撒谎**——塞进 `实测` 是 overclaim（读数不在其进程内，拿不到它自己算出的 verdict），塞进 `静态` 是 underclaim（我跑的是它装载的那份构建，不是源码文本）⇒ `SUPPORTED_HOSTS.tested` 由三档扩为**四档**（增 `进程外运行期`）。诚实性测试随之重写：档位契约抽成 `tierViolations()` 并配 **5 条合成坏样本对照**（否则「当前没有 `静态` 条目」会让那段断言恒空转——**恒为空不是证据**）。**同时证伪一条被写进 objective 的预期**：「预期会话读取 = `events-property`」源自同一批未核实假设，真值是 `snapshotEvents`。**教训**：档位表是**抗撒谎装置**，不是分类学——每多一种可获得的证据强度就该多一档，**短缺的档位会自己长出谎言**。 |
 | 2026-09-22 | **U13 阻塞复核（性质：不在插件，在使用者设置）** | 重新取证该实例现状：`profile-data/tavern/data/chats` **为空**、无 `sessions` 根 ⇒ **从未有过会话**；`.credentials.yaml` 仅 **161 B / 7 行 / 0 个 provider 键** ⇒ **无法建会话**（与 `startup-poll scanned:0` 互相印证）；酒馆 UI 侧 `dsh web authentication required`。⇒ 三重证据同向：清 U13 **只差主人一次「配 Key + 导卡 + 开一局」**。**在清掉之前档次停在 `进程外运行期`——证据变强不等于档次该升。** |
+| 2026-09-26 | **修复（语义错误 · 真实断点）+ 新增能力面（v0.6）** | **投递未成功的语义分类**（主人「加快建设进度」驱动；取证路径见下）。**断点实测**：`tavern-3081` 收到 `m-mudkvx0a-3751887f` 后连续 5 条 `{"phase":"no-target","why":"共 0 个会话，但无顶层（用户）会话——不投递"}`，最终 `{"phase":"exhausted","attempts":20}` ⇒ 消息进 `dead/`。**根因是语义错误、不是性能问题**：`no-target`（本节点**结构性**无可注入的顶层会话）与 `no-agent`/`inject-error`（**可恢复**）被同一套 `noteFailure` 处理 ⇒ 重试 20 次把消息**判死**；而 headless 适配器直接读 mailbox，**判死即读不到**——本该能工作的执行节点被插件判死而结构性收不到活。**修法**：新增 `src/miss.ts`（`classifyMiss` / `describeMiss`，纯模块 + 7 条判据）· `deliverOne` 的 `no-target` 分支改走 `structural`（保留原位、不消耗重试、落一次 `hold-no-session`）· `state.ts` 新增独立簿记 `holdNoted`（只防刷屏，滚动上限 200，**不参与投递归宿**）· 三种 `retryable` 分支统一走 `retryLater` 出口 · `sessionLite()` 新增**探测失败位**（`sessionsProbeFailed`），使「没问到」与「问到但为空」在投递侧可分。**验收**：`npm test` **157/157** exit=0（入口 `node --test tests/*.test.mjs`）+ 三组尸体样本（读数见 §7 E 表）。**同时证伪我先前的猜测**：心跳写入**本来就是原子的**（`bus.ts:85` 的 `atomicWriteJson` = 同目录临时文件 + `renameSync`）⇒ `tavern-3081` 那个「327 字节全 NUL」的心跳**不是**写非原子，真因另记（§10 U15）。**另一条读数修正**：`cluster_status` 报的「发 0 · 收 0」是**本进程**计数（不是「12 天零通信」）——trace 实测 **15459 行 / 1.76 MB**、历史上 `delivered` 仅 **4** 条，真问题是「机制在跑但没有真实协作负载」（§10 U16）。 |
+| 2026-09-26 | **D3 复核（结论：真过时，但缺口不在本次改动）** | `semantic_check` 报 D3，触发者 = 提交 **`a81b579`**「feat(leader): 主脑从静态标签到真在任——能力门 + 租约续租 + 端类型」（2026-09-23），触发文件 `src/index.ts`。**复核结论：真过时，与本次投递语义修复无关**——文档里**没有主脑租约的契约章节**（`src/leader.ts` 的 `canLead` / `decideLeader` / `grantLease` / `parseLease` / `KIND_WEIGHT` / `DEFAULT_LEASE_TTL_MS` / epoch 单调递增等均无落点；§3 只有「主脑（primary）」的**角色定义**）。⇒ 记 **U18**。**处置的诚实面**：**不**用抑制标记掩饰（⚠ 本行措辞曾误含抑制关键词，反而把 D3 压掉了——解析器是文本匹配、**不读否定**，已改）、**不**更新 `lastReviewedAt`——缺口是真的，让它继续亮；本行即 D3 的处置留痕（复核过 / 判定真过时 / 给出缺口位置与编号）。 |
 
 ## 10. 未决问题
 
@@ -478,3 +516,7 @@ payload = { v:1, net, url, host, member, secret, exp, nonce }
 - **U13「装到别人家」的端到端尚未验证（2026-09-22 新增 · 现已定位到具体阻塞）**：宿主兼容层已做到**离线单测 + 本机 0.1.6 运行期实测（= `实测` 档）+ 0.1.2-rc.1 进程外运行期取证（= `进程外运行期` 档）+ 0.1.2-rc.1 挂载运行取证**（C1/C2/C5）。**剩余缺口的性质已经查清——不在插件，在使用者设置**：① `host-compat` 只在**有会话样本**时落轨迹（刻意设计，防告警疲劳），而酒馆当前**没有任何会话**（`startup-poll scanned:0`）；② 要造一个会话，酒馆要求先配置 **API Key** 并**导入人物卡**，两者都属主人的凭据/内容（**我不擅自填**）。⇒ 清 U13 需要主人做一次「配 Key + 导卡 + 开一局」，之后我读一次 `cluster-trace.jsonl` 的 `host-compat` 行即可把该条从 `进程外运行期` 升为 `实测`，并顺手跑一次真互投。**2026-09-22 晚复核（阻塞判定不变，证据强一档）**：① 该实例**根本没有会话存储**（`profile-data/tavern/data/chats` 为空、无 `sessions` 根）；② `.credentials.yaml` 仅 **161 B / 7 行 / 0 个 provider 键** ⇒ 建不了会话；③ 已用**进程外运行期**取证把该宿主的会话读取面问清（见 C5）——但那只证明「**API 在**」，**不能替代**「该宿主**进程内**的 `host-compat` 行」。⇒ 清 U13 **仍然只差主人那一步**；在那之前档次停在 `进程外运行期`，**不许**因证据变强就自称 `实测`。**在清掉之前，不许把「可安装」说成已达成**。
   - **不要误读的一点**：`noteCompat` 不落 `no-sessions-yet` 是**刻意的**（否则每台刚装上的宿主都会先报一次「降级」，告警疲劳会把真降级淹掉）。⇒ 「轨迹里没有 `host-compat` 行」**既可能是「没跑」也可能是「没会话」**——分辨要靠 `startup-poll` 的 `scanned` 字段，不能只看有无。
 - **U14 入网令牌的吊销与已用记录清理（2026-09-22 新增）**：三个已知缺口，都**如实列出而不是假装没有**：① **没有吊销**——令牌一旦签发，在到期前一直有效（签发时已写成员册，但**撤回**要手工删 `members/<id>.json`，且**不会通知对方**）；② `join-used.json` 的 nonce **上限 500 条、滚动丢弃最旧** ⇒ 极旧的令牌理论上在窗口外可重放（窗口长度取决于入网频率）；③ 令牌是**持有者凭证**，这一点无法用密码学消除，只能靠「期限 + 一次性 + 单一身份绑定」把窗口收窄。倾向：先按现状跑，等出现**真实**需求再做吊销列表与清理——不为想象的需求加机制（与 U9 同一条纪律）。
+- **U15 心跳零字节（2026-09-26 新增 · 真因待确证）**：`nodes/LAPTOP-BF4IAPLM-tavern-3081.json` 实读 **327 字节全为 `0x00`**（`tr -dc '\000' | wc -c` = 327/327；mtime `2026-09-26 01:08:42`），名册因此报「无时间戳 · 心跳损坏」。**已排除**「写入非原子」——`bus.ts:85` 的 `atomicWriteJson` 本就是「同目录临时文件 + `renameSync`」（模块头注即写明「读者永远看到完整文件」）⇒ 形态更像**原子性 ≠ 持久性**（`writeFileSync` 后无 `fsync`：NTFS 元数据已落盘而数据页未落）。**旁证**：`state/` 里有 `LAPTOP-BF4IAPLM-web-2238.json.tmp-32732-mue87srv-ac8ac9`（**0 字节**，2026-09-23 22:56）——原子写中途死亡的化石。**待办**：先给出**可复现判据**（而非只凭形态相似就下结论），再定修法（写入侧补 `fsync` / 读取侧标损坏并显示「上次有效 mtime」，二者取一或都做）。**读者侧现状**：已能识别（`cluster_nodes` 报「心跳损坏」），但**不自愈、不清理**，且理由信息量为零（只有「无时间戳」）。
+- **U16 轨迹刷屏（2026-09-26 新增）**：`cluster-trace.jsonl` 实测 **15459 行 / 1.76 MB**，其中 `leader-auto` **7132** + `leader-renew` **7128** = **14260 行（92%）** 全是主脑租约续期（约每 2.4 分钟一条）。真问题不是磁盘，是**信噪比**——定位断点时读数被淹没。候选修法：租约续期只在**状态变化**时落痕（取得 / 让位 / 换 epoch），稳定续期改为**计数汇总**（每 N 次落一条）。**判据**：改造后单日 trace 行数下降 ≥ 一个数量级，且「主脑何时变过」仍可从轨迹重建。
+- **U18 主脑租约无文档（2026-09-26 D3 复核发现）**：`src/leader.ts`（`NodeKind` / `KIND_WEIGHT` / `DEFAULT_INELIGIBLE` / `DEFAULT_LEASE_TTL_MS` / `RENEW_DIVISOR` / `LeaderLease` / `canLead` / `decideLeader` / `grantLease` / `renewIntervalMs` / `parseLease` / `describeLeader`）是 **2026-09-23 提交 `a81b579`** 引入的能力面（「主脑从静态标签到真在任——能力门 + 租约续租 + 端类型」），但本文件**没有对应契约章节**——§3 只有「主脑（primary）」的角色定义，缺租约的 TTL / epoch 单调递增 / 能力门 / 续期与让位契约。**修法**：先读 `leader.ts`（**必须读实现再写**，本插件已吃过「未核实假设长成事实」的亏），再补 §5.13 与 §7 验收判据。**为何不立刻补**：本次会话在做 P0（投递语义分类 §5.12），补租约文档是**独立工作**——混做会让两次改动互相污染（本插件 §9 已有「一份实现散在多处必然漂移」的教训）。**在补上之前 D3 保持亮着**（不抑制、不更新 `lastReviewedAt`）。
+- **U17 网络无真实协作负载（2026-09-26 新增 · 本次断点修复只解了「能不能」，没解「有没有」）**：`tasks/` 只有 **1** 条台账（2026-09-15）、`logs/actions/` 只有 **1** 个行为事件文件（2026-09-15）、`members/` 目录不存在、历史上 `delivered` 仅 **4** 条。⇒ 本插件的**机制完备度**远高于它的**使用量**。这是「智能体网络建设」的真瓶颈（不是协议不够标准）。**已拆解为任务板条目**：P0 解 no-target 断点（本条目所属的 v0.6）→ P1 跨实例产物传递（借鉴 A2A 的 Part/Artifact）→ P2 身份卫生三件 → P3 Agent Card 化。**判据**：一条真任务走完 `dispatch → running → result → verdict` 全链路（台账 + 行为事件 + 结果四字段齐备）。
