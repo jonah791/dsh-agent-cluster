@@ -195,6 +195,29 @@ const describe = (s) => {
   }
 }
 
+/** 产物证据（对照 A2A 的 FilePart 两态：`FileWithBytes` / `FileWithUri`）。
+ *
+ *  动机（2026-09-26）：原先证据只带 `path`（**本机路径**）⇒ 主脑换一台机器就复算不了哈希，
+ *  「证据可复现」在跨机场景直接失效。A2A 的解法是 Part 两态——**能内联就内联，不能就给引用
+ *  并说清代价**。这里照做：小产物内联（主脑**不碰节点文件系统**就能复算 sha256），
+ *  大产物给 `uri` + 明确标注「只有本机能取到」。
+ *  ⚠ 阈值取 8 KiB：消息是落盘文件（`mailbox/*.json`），内联太大等于把总线当传输层用。 */
+const INLINE_MAX_BYTES = 8 * 1024
+
+const fileEvidence = (relPath, absPath, buf, note) => {
+  const ev = { kind: 'file-digest', path: relPath, sha256: sha256(buf), bytes: buf.length, note }
+  if (buf.length <= INLINE_MAX_BYTES) {
+    ev.part = { kind: 'file', inline: { encoding: 'base64', data: buf.toString('base64'), bytes: buf.length } }
+  } else {
+    ev.part = {
+      kind: 'file',
+      uri: 'file:///' + String(absPath).replace(/\\/g, '/'),
+      note: '超过 ' + String(INLINE_MAX_BYTES) + ' B 内联上限，只有本机能取到',
+    }
+  }
+  return ev
+}
+
 /** 执行一步；返回 { evidence? }；越界抛 BlockedError，其它错误抛 Error */
 const execStep = (s) => {
   const op = String(s.op)
@@ -212,7 +235,7 @@ const execStep = (s) => {
       const mode = s.mode ?? 'overwrite'
       if (mode === 'create' && existsSync(abs)) throw new Error('create 模式：文件已存在 ' + s.path)
       writeAtomic(abs, content)
-      return { evidence: { kind: 'file-digest', path: s.path, sha256: sha256(Buffer.from(content, 'utf8')), note: 'written' } }
+      return { evidence: fileEvidence(s.path, abs, Buffer.from(content, 'utf8'), 'written') }
     }
     case 'fs.replace': {
       if (!existsSync(abs)) throw new Error('目标不存在：' + s.path)
@@ -225,7 +248,7 @@ const execStep = (s) => {
       if (expect !== null && count !== expect) throw new Error('命中数 ' + String(count) + ' ≠ expectCount ' + String(expect))
       const after = before.split(find).join(String(s.replace ?? ''))
       writeAtomic(abs, after)
-      return { evidence: { kind: 'file-digest', path: s.path, sha256: sha256(Buffer.from(after, 'utf8')), note: 'replaced×' + String(count) } }
+      return { evidence: fileEvidence(s.path, abs, Buffer.from(after, 'utf8'), 'replaced×' + String(count)) }
     }
     case 'fs.remove': {
       if (!existsSync(abs)) return { evidence: { kind: 'assert', path: s.path, ok: true, note: '本就不存在' } }
@@ -241,7 +264,7 @@ const execStep = (s) => {
     case 'fs.digest': {
       if (!existsSync(abs)) throw new Error('目标不存在：' + s.path)
       const buf = readFileSync(abs)
-      return { evidence: { kind: 'file-digest', path: s.path, sha256: sha256(buf), bytes: buf.length, note: 'digest' } }
+      return { evidence: fileEvidence(s.path, abs, buf, 'digest') }
     }
     default:
       throw new Error('未实现：' + op)
