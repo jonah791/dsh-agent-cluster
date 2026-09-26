@@ -725,7 +725,15 @@ export function apply(ctx: Context, config: Config): void {
     }
     if (!readyToRetry(state, msg.id, nowMs)) return 'pending'
     if (!config.autoInject) {
-      trace('held', { id: msg.id, why: 'autoInject=false，留给 cluster_inbox 取用' })
+      // 落痕只做一次：与下方的 no-session 分支同一条纪律，同一个 `holdNoted` 簿记。
+      // 这条分支同样每轮轮询都会走到——每轮都落会把 trace 刷满同一个 id，
+      // 并让 `cluster_status` 的「最近」列表失去分辨力（2026-09-27 实测同 id 相隔 2007ms 连落三行）。
+      // 两个分支天然互斥：此处 return 后走不到 no-session 分支，共用标记无干扰。
+      if (!isHoldNoted(state, msg.id)) {
+        state = markHoldNoted(state, msg.id, nowMs)
+        persist()
+        trace('held', { id: msg.id, why: 'autoInject=false，留给 cluster_inbox 取用' })
+      }
       return 'pending'
     }
     const decisionT = decideTarget(sessionLite(), config.mainSessionId !== '' ? config.mainSessionId : undefined, {})
