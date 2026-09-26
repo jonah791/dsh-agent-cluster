@@ -16,7 +16,7 @@
  *   - 一切观测写（trace/状态）吞错返回 false，绝不反噬主流程（I7）。
  */
 
-import { appendFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** 总线路径集合。 */
@@ -182,6 +182,55 @@ export function listDirs(dir: string): string[] {
 export function removeIfExists(path: string): boolean {
   try {
     rmSync(path, { force: true })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 递归统计目录下的**文件**数（目录本身不计；路径不存在返回 0）。
+ * 用途：`removeDirIfEmpty` 的判据——此处「空」指**一个文件都没有**，空子目录不算内容。
+ */
+export function countFilesRecursive(dir: string): number {
+  try {
+    let n = 0
+    for (const d of readdirSync(dir, { withFileTypes: true })) {
+      if (d.isDirectory()) n += countFilesRecursive(join(dir, d.name))
+      else n += 1
+    }
+    return n
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * 只删**完全空**的目录（递归无文件）：先逐层摘空子目录，再删自己。
+ *
+ * **为什么不用 `rm -rf`（双重保险）**：全程只用 `rmdirSync`——它**只在目录为空时成功**，
+ * 所以即便调用方的判空逻辑有误，`rmdir` 也只会失败、不会误删；本函数**永不删除文件**，
+ * 遇到任何文件立即放弃整棵子树。
+ *
+ * 判据来源（I12 / U10 残余）：`mailbox/<nodeId>/` 里**有归档消息的目录是审计资产**
+ * （`done/`、`dead/`），空壳才是垃圾。故「空」按**递归文件数 = 0** 判定。
+ *
+ * @param dir - 目标目录
+ * @returns true = 目录已不存在（删成功或本就不存在）；false = 仍有内容，**原样保留**
+ */
+export function removeDirIfEmpty(dir: string): boolean {
+  let names
+  try {
+    names = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return true // 不存在即视为已清理
+  }
+  for (const d of names) {
+    if (!d.isDirectory()) return false // 有文件 ⇒ 保留（绝不删文件）
+    if (!removeDirIfEmpty(join(dir, d.name))) return false // 子目录非空 ⇒ 整棵保留
+  }
+  try {
+    rmdirSync(dir)
     return true
   } catch {
     return false

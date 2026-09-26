@@ -173,6 +173,33 @@ export function shouldReap(
 }
 
 /**
+ * 从信箱目录名里挑出**可回收的空壳**：我的血统 + 完全空。
+ *
+ * 为什么抽成纯函数（技能 dsh-plugin-testability）：这是**会删数据的判据**，埋在插件
+ * `apply` 闭包里就只能靠集成测。目录内容由调用方探得（`filesOf`），本函数不碰磁盘
+ * ⇒ 可离线逐例验证。
+ *
+ * 保守优先（对照 `shouldReap`）：**任何不确定都按「保留」**——`filesOf` 未知时应给 > 0；
+ * 即便它误给 0，也只是多清一个空目录（`removeDirIfEmpty` 只用 `rmdir`，仍不会删文件）。
+ *
+ * @param names - `mailbox/` 下的目录名（目录名即 nodeId）
+ * @param me - 本机 hostname + profile（血统前缀的来源）
+ * @param filesOf - 目录名 → 该目录**递归文件数**（IO 层探得）
+ * @returns 可回收的目录名（其余一律保留）
+ */
+export function pickReapableMailboxes(
+  names: readonly string[],
+  me: { hostname: string; profile: string },
+  filesOf: (name: string) => number,
+): string[] {
+  return names.filter(
+    (name) =>
+      isOwnLineage({ nodeId: name, hostname: me.hostname, profile: me.profile }, me) &&
+      filesOf(name) === 0,
+  )
+}
+
+/**
  * 节点是否在线：唯一判据（I4 判据单一真源，名册显示/发送警告/计数共用它）。
  * @param hb - 心跳（至少含 atMs）
  * @param nowMs - 当前时刻

@@ -4,8 +4,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  DEFAULT_OFFLINE_AFTER_MS, ageText, deriveNodeId, isOwnLineage, nodeOnline, parseHeartbeat, resolveCollision,
-  sanitizeId, shouldReap,
+  DEFAULT_OFFLINE_AFTER_MS, ageText, deriveNodeId, isOwnLineage, nodeOnline, parseHeartbeat, pickReapableMailboxes,
+  resolveCollision, sanitizeId, shouldReap,
 } from '../lib/identity.js'
 
 const NOW = 1_700_000_000_000
@@ -146,4 +146,30 @@ test('shouldReap 尸体测试：只有「我的血统 + pid 确认已死 + 不�
   assert.equal(shouldReap(hb({ nodeId: 'H-web-0-9776' }), me, { pidAlive: false }), false, '自己那份不能删')
   assert.equal(shouldReap(hb({ pid: 0 }), me, { pidAlive: false }), false, 'pid 无效 ⇒ 保留')
   assert.equal(shouldReap(hb({ hostname: 'OTHER' }), me, { pidAlive: false }), false, '别的机器')
+})
+
+/* ─────────── 信箱空壳判据（2026-09-26 · t-afbab493） ─────────── */
+
+test('pickReapableMailboxes：只挑「我的血统 + 完全空」——别人的血统与有内容的一律保留', () => {
+  const me = { hostname: 'H', profile: 'web' }
+  const names = [
+    'H-web-100',      // 我的血统 + 空 ⇒ 可回收
+    'H-web-200',      // 我的血统 + 有内容 ⇒ 保留
+    'H-web-0',        // 我的血统（回收后的稳定身份）+ 空 ⇒ 可回收
+    'H-tavern-3081',  // 同主机、别的 profile ⇒ 不是我的血统
+    'OTHER-web-1',    // 别的主机 ⇒ 不是我的血统
+    'demo-worker',    // 别人的节点 ⇒ 不是我的血统（A13 kept 名单纪律）
+    'sim-node-a',     // 同上
+  ]
+  const filesOf = (name) => (name === 'H-web-200' ? 1 : 0)
+  assert.deepEqual(
+    pickReapableMailboxes(names, me, filesOf),
+    ['H-web-100', 'H-web-0'],
+    '只有我的空壳入选；顺序保持原序',
+  )
+
+  // 尸体样本（保守优先，对照 shouldReap 的同款纪律）：内容未知 ⇒ 按「有内容」处理 ⇒ 一个也不挑
+  assert.deepEqual(pickReapableMailboxes(names, me, () => 99), [], '未知一律保留')
+  // 空名单 ⇒ 空（幂等）
+  assert.deepEqual(pickReapableMailboxes([], me, () => 0), [])
 })

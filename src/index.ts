@@ -25,12 +25,12 @@ import { randomBytes } from 'node:crypto'
 import { homedir, hostname as osHostname } from 'node:os'
 import { join } from 'node:path'
 import {
-  appendTrace, atomicWriteJson, busPaths, ensureBusDirs, inboxDir, isFile, listJsonFiles,
-  moveToBucket, nodeFile, publishNoClobber, readJsonValue, removeIfExists,
+  appendTrace, atomicWriteJson, busPaths, countFilesRecursive, ensureBusDirs, inboxDir, isFile, listDirs, listJsonFiles,
+  moveToBucket, nodeFile, publishNoClobber, readJsonValue, removeDirIfEmpty, removeIfExists,
   stateFile, tailTrace, takeOverInbox, type BusPaths,
 } from './bus.ts'
 import {
-  ageText, deriveNodeId, nodeOnline, parseHeartbeat, resolveCollision, sanitizeId, shouldReap, type Heartbeat,
+  ageText, deriveNodeId, nodeOnline, parseHeartbeat, pickReapableMailboxes, resolveCollision, sanitizeId, shouldReap, type Heartbeat,
 } from './identity.ts'
 import {
   canLead, decideLeader, describeLeader, grantLease, normalizeKind, parseLease, renewIntervalMs,
@@ -350,6 +350,38 @@ export function apply(ctx: Context, config: Config): void {
   }
   const swept = sweepLineage()
   if (swept.reaped.length > 0) trace('reap-lineage', { reaped: swept.reaped.length, ids: swept.reaped, kept: swept.kept })
+
+  /**
+   * 信箱空壳清扫（2026-09-26 · t-afbab493）：A13 收了前身的**心跳与状态**，却没管它留下的
+   * **信箱目录**——web 每次重启因同名心跳新鲜而改名避让（`web-0` → `web-0-<pid>`），
+   * 每个新 nodeId 就多一个 `mailbox/<nodeId>/`；实测一次扫出 **188 个空壳**
+   * （2026-09-26 22:54，形态清一色 `LAPTOP-BF4IAPLM-web-<pid>`；已手工清理至 10）。
+   *
+   * 判据（三条，与 A13 同源）：
+   *   ① 只碰**自己的血统**——目录名即 nodeId，走 `isOwnLineage`；别人的目录由各自所有者负责；
+   *   ② 只清**完全空**的目录——`countFilesRecursive` 判「一个文件都没有」，
+   *      再由 `removeDirIfEmpty` 执行（**只用 rmdir，永不删文件**）；
+   *   ③ **不碰名册与投递**——只动 mailbox 目录，不碰 `nodes/`、不改消息。
+   *
+   * 动机：空壳让「这条总线上有谁」看起来比实际多（星图多画离线星）；而**有归档消息的
+   * 目录是审计资产**（I12、U10 残余），一律保留。
+   */
+  const sweepEmptyMailbox = (): { removed: string[]; kept: number } => {
+    const removed: string[] = []
+    const names = listDirs(paths.mailboxDir)
+    const me = { hostname: facts.hostname, profile }
+    // 判据走纯函数（离线可测）：我的血统 + 完全空。目录内容由 IO 层探得后**显式传入**
+    // ——「事实由 IO 查得、逻辑只做判定」是 A13 定下的同一分工（I12）。
+    const reapable = pickReapableMailboxes(names, me, (name) => countFilesRecursive(join(paths.mailboxDir, name)))
+    for (const name of reapable) {
+      if (removeDirIfEmpty(join(paths.mailboxDir, name))) removed.push(name)
+    }
+    return { removed, kept: names.length - removed.length }
+  }
+  const sweptMailbox = sweepEmptyMailbox()
+  if (sweptMailbox.removed.length > 0) {
+    trace('reap-mailbox-empty', { removed: sweptMailbox.removed.length, ids: sweptMailbox.removed, kept: sweptMailbox.kept })
+  }
 
   // ── 状态（I3 幂等集合 + 重试账）──
   const loaded = ((): NodeState => {

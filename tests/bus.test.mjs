@@ -8,8 +8,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFil
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  appendTrace, atomicWriteJson, busPaths, ensureBusDirs, inboxDir, isFile, listDirs, listJsonFiles,
-  moveToBucket, nodeFile, publishNoClobber, readJsonValue, removeIfExists, stateFile, tailTrace,
+  appendTrace, atomicWriteJson, busPaths, countFilesRecursive, ensureBusDirs, inboxDir, isFile, listDirs, listJsonFiles,
+  moveToBucket, nodeFile, publishNoClobber, readJsonValue, removeDirIfEmpty, removeIfExists, stateFile, tailTrace,
 } from '../lib/bus.js'
 
 const freshRoot = () => mkdtempSync(join(tmpdir(), 'cluster-bus-'))
@@ -136,4 +136,38 @@ test('isFile/removeIfExists：普通文件判定与幂等删除', () => {
   assert.equal(isFile(root), false)
   assert.equal(removeIfExists(f), true)
   assert.equal(removeIfExists(f), true, '再删不存在的路径仍算成功（幂等）')
+})
+
+/* ─────────── 信箱空壳清扫原语（2026-09-26 · t-afbab493） ─────────── */
+
+test('removeDirIfEmpty/countFilesRecursive：只删空目录，有**任何**文件即整棵保留', () => {
+  const root = freshRoot()
+
+  // ① 全空（含空子目录树，形态同 mailbox/<nodeId>/{done,dead}）→ 清除
+  const emptyTree = join(root, 'H-web-111')
+  mkdirSync(join(emptyTree, 'done'), { recursive: true })
+  mkdirSync(join(emptyTree, 'dead'), { recursive: true })
+  assert.equal(countFilesRecursive(emptyTree), 0, '空目录树应报 0 个文件')
+  assert.equal(removeDirIfEmpty(emptyTree), true)
+  assert.equal(existsSync(emptyTree), false, '全空目录应被清除')
+
+  // ② 尸体样本：只有**深层**子目录里有一个文件 → 整棵保留（上层虽空也不动）
+  const withFile = join(root, 'H-web-222')
+  mkdirSync(join(withFile, 'done'), { recursive: true })
+  writeFileSync(join(withFile, 'done', 'm-1.json'), '{}', 'utf8')
+  assert.equal(countFilesRecursive(withFile), 1)
+  assert.equal(removeDirIfEmpty(withFile), false, '有归档消息 ⇒ 保留（I12 审计资产）')
+  assert.equal(existsSync(join(withFile, 'done', 'm-1.json')), true, '★ 文件绝不能被删')
+  assert.equal(existsSync(join(withFile, 'done')), true, '★ 含文件的子目录也不能被摘掉')
+
+  // ③ 顶层散落文件（待投递消息）→ 保留
+  const topFile = join(root, 'H-web-333')
+  mkdirSync(topFile, { recursive: true })
+  writeFileSync(join(topFile, 'pending.json'), '{}', 'utf8')
+  assert.equal(removeDirIfEmpty(topFile), false)
+  assert.equal(existsSync(topFile), true)
+
+  // ④ 不存在 → true（幂等：视为已清理），且读数不抛
+  assert.equal(removeDirIfEmpty(join(root, 'nope')), true)
+  assert.equal(countFilesRecursive(join(root, 'nope')), 0)
 })
