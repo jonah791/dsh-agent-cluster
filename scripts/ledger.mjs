@@ -12,7 +12,10 @@
  *   new      --intent <原话> --acceptance <判据> --assignee <nodeId> [--grade L1|L2|L3]
  *            [--steps "a;b;c"] [--budget-turns N] [--budget-calls N]
  *   dispatch --task <taskId> [--payload <file.json>] [--text <说明>]
- *   collect  --as <primaryNodeId>          # 扫自己收件箱，把 result 回填台账（批处理）
+ *   collect  --as <primaryNodeId> [--purge-nonresult true]
+ *            # 扫自己收件箱：result 回填台账；**非 result 默认只报告、不归档**
+ *            # （主脑收件箱没有第二个消费者，静默跳过 = 无限滞留，实测挂过 11 天；
+ *            #   给了 --purge-nonresult true 才移进 done/——归档 ≠ 删除，I2 不破）
  *   verdict  --task <taskId> --pass true|false --method <复现证据|核对证据> --note <说明>
  *   list     [--status <s>] [--assignee <id>]
  *   show     --task <taskId>
@@ -159,13 +162,24 @@ const cmdCollect = () => {
   if (as === '') die('缺少 --as <primaryNodeId>（主脑自己的 nodeId）')
   const inbox = join(busDir, 'mailbox', as)
   if (!existsSync(inbox)) die('收件箱不存在：' + inbox)
+  // 非 result 消息**默认保留**（可能是别人的 chat/event，误吞会毁证据）；
+  // 要清理必须显式给值 'true' —— 本 CLI 没有布尔标志（见文件末注：PS 吞空串曾导致静默填 'true'）。
+  const purgeNonResult = String(args['purge-nonresult'] ?? '') === 'true'
   let n = 0
+  const others = []
   for (const name of readdirSync(inbox).filter((x) => x.endsWith('.json'))) {
     const file = join(inbox, name)
     const msg = readJsonSafe(file)
     if (msg === null) continue
     const taskId = msg.meta !== undefined && msg.meta !== null ? String(msg.meta.taskId ?? '') : ''
-    if (String(msg.kind) !== 'result' || taskId === '') continue
+    if (String(msg.kind) !== 'result' || taskId === '') {
+      // 原先这里直接 continue ⇒ 消息在 inbox 里**无限滞留**：主脑收件箱没有第二个消费者
+      // （插件的轮询只扫自己的 nodeId，`primary` 不是注册节点）。实测 2026-09-15 的
+      // demo-worker event 挂了 11 天。**滞留 ≠ 保留**——没人处理的文件只是没人管，
+      // 所以至少要让它被看见。
+      others.push({ name, kind: String(msg.kind ?? '?'), from: String(msg.from ?? '?') })
+      continue
+    }
     const p = taskPath(taskId)
     if (!existsSync(p)) { ok('!! 收到 ' + taskId + ' 的结果但无台账（孤儿结果）：' + name); continue }
     const task = readJson(p)
@@ -185,6 +199,20 @@ const cmdCollect = () => {
     try { renameSync(file, join(done, name)) } catch { /* 留待下次 */ }
     n += 1
     ok('collected ' + taskId + ' ← ' + String(msg.from) + '  status=' + String(msg.meta.status) + '  evidence=' + String(task.result.evidence.length))
+  }
+  if (others.length > 0) {
+    // 归档 ≠ 删除（I2「消息不丢」不破）；显式列出，让「谁在滞留」可诊断。
+    ok('非 result 消息 ' + String(others.length) + ' 条（默认保留，不吞证据）：')
+    for (const o of others) ok('  · ' + o.name + '  kind=' + o.kind + '  from=' + o.from)
+    if (purgeNonResult) {
+      const done = join(inbox, 'done')
+      mkdirSync(done, { recursive: true })
+      let moved = 0
+      for (const o of others) { try { renameSync(join(inbox, o.name), join(done, o.name)); moved += 1 } catch { /* 留待下次 */ } }
+      ok('已归档 ' + String(moved) + '/' + String(others.length) + ' 条到 done/（归档 ≠ 删除）')
+    } else {
+      ok('  清理：node scripts/ledger.mjs collect --as ' + as + ' --purge-nonresult true')
+    }
   }
   ok('collect 完成：回填 ' + String(n) + ' 条')
 }
