@@ -520,6 +520,10 @@ payload = { v:1, net, url, host, member, secret, exp, nonce }
 
 | 2026-09-27 | **新增能力面（P3 · 能力卡片）+ 更正一条长期错误认知** | 任务板 `t-1e1f5084`。**先更正**：本文件 §3/§4 一直写着「能力声明 = 节点心跳里的 `capabilities[]`」——**读代码发现它不在心跳里**（`Heartbeat` 无此字段），只在跨机成员册（`MemberRecord.capabilities`）；心跳里唯一的能力性质字段是布尔 `leaderCapable`。⇒ 两处就地更正（不改史）。**这正是「能力可发现」的真缺口**：`cluster_nodes` 读的只是心跳面，而能力在成员册面 ⇒ **名册里看不到任何节点的能力**。**新增** `src/agent-card.ts`（纯模块）：`deriveAgentCard(heartbeat, member?, offlineAfterMs)` / `parseAgentCard` / `renderCardSummary`，形状对齐 A2A AgentCard（`id/kind/role/capabilities[]/skills[]/endpoint/auth/protocolVersion/ttl`），**不引 SDK、不改协议信封**。三条承重设计：① **来源三分**（`declared`/`inferred`/`undeclared`）——**没有的字段就说没有**，本卡刻意**不设「实测」档**；② 能力的 `claimed` 恒真、`verified` **只由探针实测置位**（缺席即未实测）——「不许默认 verified」正是这张卡存在的理由；③ `auth`/`skills` 当前**没有声明来源** ⇒ 恒 `undeclared`（留字段是为形状对齐，不是为填内容）。**消费点只有一个**：`index.ts` 的 `roster()` 一次读盘建 `memberById` 索引后派生，`cluster_nodes` 把 `cardSummary` 渲染为**缩进一行**（与「心跳事实」那行分开——两类信息混一行读不出层次）。**验收**：`npm test` **166/166** exit=0（原 159 + 新 7，判据见 §7 **P 表**）。**两条判据是尸体**：旧格式心跳必须产出 `undeclared`（实现里若写 `?? 'desktop'` 必红）；能力项**不得含 `verified` 键**（`false` 也是撒谎）。⚠ **范围标注**：本条只交付**形状 + 来源标注**；「探针任务把 `claimed` 升为 `verified`」**未做**（§10 **U19**）——不许把 P3 读成已闭环。 |
 
+| 2026-09-27 | **文档结构修复（D4 归零）** | `semantic_check` 报 D4「必备结构缺节（1/10）：未决问题」——**内容其实一直都在**（U1–U19 齐全），缺的只是**节标题**：U 列表直接接在 §9 表格之后，全文 `grep "未决问题"` **零命中**；而 §9 内两处引用（「§10 **U17** 首次破局」「§10 **U19**」）**早已把这个节当存在来引用**——写内容的人以为标题写了，实际漏了。⇒ 补 `## 10. 未决问题` 一行（`git diff --stat`：**2 insertions, 0 deletions**），D1–D6 全过。**教训（可复用）**：**D4 报缺节时，先查内容是否已在**——「有内容、缺标题」与「真没写」是两种病：前者一行可愈，后者要重写整节，而**误判会让人把已有内容再写一遍**（生产重复）。判据是 `grep <节名>` + 看尾部结构，**不是凭记忆**——本次我压缩前的记忆正是「§10 已写」，错了。 |
+
+## 10. 未决问题
+
 - **U1 实时推送通道**：轮询延迟（默认 2s）是否够用？是否需要 HTTP 推送（自建 `/cluster` 路由 + 总线密钥）？——若启用，需先确认非 `/api` 路由是否绕过宿主认证（取证进行中）。
 - **U2 消息语义状态机**：`task`/`result` 是否需要回执（ack）、超时、状态流转？——**部分回答（v0.2）**：三态回报（started/progress/blocked）与 result 四字段已定；**ack 与超时重派仍未定**。
 - **U3 面板可视化**：名册与消息流是否要以面板呈现（`dsh-panel` 形态）？
