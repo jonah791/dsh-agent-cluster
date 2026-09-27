@@ -471,7 +471,7 @@ payload = { v:1, net, url, host, member, secret, exp, nonce }
 | P2 | 能力恒 `claimed`；**未实测时 `verified` 必须缺席**（写 `false` 同样是撒谎——等于宣称「验过且不行」） | §3 能力卡片 | **单测已验** | ✔ 同 ②（承重判据）：能力 = 成员册 `capabilities[]` ∪ 心跳 `leaderCapable`，且逐项断言 `'verified' in cap === false` |
 | P3 | 来源三分正确：协议版本由心跳 `v` 推来标 `inferred`，成员册 `protocol` 标 `declared`；推断必须写明依据字段 | §3 能力卡片 | **单测已验** | ✔ 同 ③（`from: 'heartbeat.v'` / `'member.protocol'`） |
 | P4 | 畸形输入一律不抛且降级为未声明；`derive → JSON → parse` 往返逐字段保真 | §3 能力卡片 | **单测已验** | ✔ 同 ④⑤（null/数组/字符串/数字/多余字段/版本不符各一） |
-| P5 | 线上 `cluster_nodes` 能看到至少一个节点的**字段来源标注** | §3 能力卡片 | **待线上验收** | 重启后实调 `cluster_nodes` |
+| P5 | 线上 `cluster_nodes` 能看到至少一个节点的**字段来源标注** | §3 能力卡片 | **已实测**（2026-09-27 13:26） | ✔ 重启后实调：`role=执行节点(声明) · 端点=http://127.0.0.1:3091(声明) · 协议=heartbeat-v1(推断)`——**推断档真的出现在线上**。**同时是「不伪造」的现场证据**：`kind` 与能力**都没显示**，因为心跳里确实没有 `kind`、`members/` 也确实为空 ⇒ 该说的说、没有的不编（若实现里写了 `?? 'desktop'`，这里会多出一条伪造的 `kind=desktop(声明)`） |
 | P6 | **能力实测闭环**：探针任务使 `claimed` 升为 `verified:true`（带证据）；自称但做不到 ⇒ `refuted` + 留证 | §3 能力卡片 | **未做** | 见 §10 **U19**——形状与字段已就位，探针契约未设计 |
 
 ## 8. 与实现的关系
