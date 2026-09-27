@@ -54,6 +54,7 @@ import { classifyMiss, describeMiss, type MissReason } from './miss.ts'
 import { describeCompat, probeHostCompat, probeServices, readSessionEvents, type HostCompat } from './host-compat.ts'
 // 跨机承载（`docs/members.md` §5）：传输适配器 + 自开端点 + 成员册。
 // 这一层是对 §6「不做网络」的**有意修订**——纪律是默认关闭 + fail-closed。
+import { deriveAgentCard, renderCardSummary } from './agent-card.ts'
 import { parseMemberRecord, type MemberRecord } from './transport.ts'
 import { JOIN_PATH, memberDirOf, postJson, pushToPeer, readMembersFromDisk, startHttpNode, type HttpNodeHandle } from './http-node.ts'
 // 入网（§5.11）：令牌 = 一次入网的完整凭据（地址 + 该成员专属密钥 + 已裁决的准入）。
@@ -265,6 +266,12 @@ interface RosterEntry {
   online: boolean
   self: boolean
   corrupt: boolean
+  /**
+   * 能力卡片摘要（`agent-card.ts`）：**带来源标注**（声明 / 推断 / 未声明）。
+   *
+   * 心跳损坏时缺席——坏心跳派生不出卡片，此处**不造占位**（卡片的存在意义就是不许撒谎）。
+   */
+  cardSummary?: string
 }
 
 /** 启动插件。 */
@@ -426,6 +433,10 @@ export function apply(ctx: Context, config: Config): void {
   const roster = (includeOffline: boolean): RosterEntry[] => {
     const now = Date.now()
     const out: RosterEntry[] = []
+    // 卡片要从**两个面**派生：能力只在跨机成员册（`members/*.json`），端类型只在心跳
+    // （`nodes/*.json`）——所以这里**一次读盘建索引**，不在循环里逐节点重复读
+    // （名册最多 maxRoster 条，重复读盘是 O(n) 次文件系统往返）。
+    const memberById = new Map(readMemberList().map((m) => [m.memberId, m]))
     for (const f of listJsonFiles(paths.nodesDir)) {
       if (out.length >= config.maxRoster) break
       const raw = readJsonValue(join(paths.nodesDir, f))
@@ -454,6 +465,9 @@ export function apply(ctx: Context, config: Config): void {
         online,
         self: hb.nodeId === nodeId,
         corrupt: false,
+        cardSummary: renderCardSummary(
+          deriveAgentCard(hb, memberById.get(hb.nodeId), config.offlineAfterMs),
+        ),
       })
     }
     return out.sort((a, b) => Number(b.online) - Number(a.online) || a.nodeId.localeCompare(b.nodeId))
@@ -1162,6 +1176,7 @@ export function apply(ctx: Context, config: Config): void {
                 ageText: { type: 'string' },
                 self: { type: 'boolean', required: true },
                 corrupt: { type: 'boolean', required: true },
+                cardSummary: { type: 'string' },
               },
             },
           },
@@ -1175,7 +1190,12 @@ export function apply(ctx: Context, config: Config): void {
           const role = n['role'] === '' || n['role'] === undefined ? '' : ' [' + String(n['role']) + ']'
           const age = n['ageText'] === undefined ? '' : ' · 心跳 ' + String(n['ageText']) + ' 前'
           const corrupt = n['corrupt'] === true ? ' · 心跳损坏' : ''
-          return '- ' + String(n['nodeId']) + role + ' · ' + mark + age + corrupt
+          // 卡片另起一行缩进：它是**带来源标注**的派生视图（声明/推断/未声明），
+          // 与上面那行「心跳事实」不是同一类信息，混在一行会读不出层次。
+          const card = typeof n['cardSummary'] === 'string' && n['cardSummary'] !== ''
+            ? '\n    ' + n['cardSummary']
+            : ''
+          return '- ' + String(n['nodeId']) + role + ' · ' + mark + age + corrupt + card
         })
         return [{ type: 'text', text: '集群名册（' + String(v['online']) + ' 在线 / 共 ' + String(v['total']) + '）\n' + lines.join('\n') }]
       },
@@ -1199,6 +1219,7 @@ export function apply(ctx: Context, config: Config): void {
           ageText: Number.isFinite(r.ageMs) ? ageText(r.ageMs) : '无时间戳',
           self: r.self,
           corrupt: r.corrupt,
+          ...(r.cardSummary === undefined ? {} : { cardSummary: r.cardSummary }),
         })),
       }
     },
