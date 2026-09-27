@@ -34,8 +34,11 @@ import {
 } from './identity.ts'
 import {
   canLead, decideLeader, describeLeader, grantLease, normalizeKind, parseLease, renewIntervalMs,
-  type LeaderCandidate, type LeaderLease,
+  type LeaderAction, type LeaderCandidate, type LeaderLease,
 } from './leader.ts'
+import {
+  decideLeaderTrace, initialLeaderTraceState, type LeaderTraceState,
+} from './leader-trace.ts'
 import {
   DEFAULT_MAX_TEXT_CHARS, injectionText, isExpired, makeMessage, parseMessage, MESSAGE_KINDS,
   type MessageKind,
@@ -923,7 +926,7 @@ export function apply(ctx: Context, config: Config): void {
    * @param nowMs - 本次裁决的时刻。
    * @returns 结果说明 + 是否真的写了总线（供调用方决定要不要记轨迹）。
    */
-  const applyLeaderDecision = (nowMs: number): { note: string; wrote: boolean } => {
+  const applyLeaderDecision = (nowMs: number): { note: string; wrote: boolean; action: LeaderAction } => {
     const lease = readLeaderLease()
     const decision = decideLeader({
       self: nodeId, candidates: leaderCandidates(nowMs), lease, nowMs, ttlMs: config.leaderLeaseTtlMs,
@@ -936,11 +939,11 @@ export function apply(ctx: Context, config: Config): void {
       )
       if (r.ok && !r.duplicate) {
         appendTrace(paths.traceFile, { at: nowMs, phase: 'leader-take', nodeId, epoch: decision.epoch })
-        return { note: '已抢占 epoch ' + decision.epoch + ' → ' + dest, wrote: true }
+        return { note: '已抢占 epoch ' + decision.epoch + ' → ' + dest, wrote: true, action: 'take' }
       }
       return {
         note: '抢占失败（' + (r.duplicate ? '同一 epoch 已被别人创建' : String(r.error)) + '）——本轮不重试',
-        wrote: false,
+        wrote: false, action: 'take',
       }
     }
     if (decision.action === 'renew') {
@@ -949,15 +952,24 @@ export function apply(ctx: Context, config: Config): void {
         dest, grantLease(nodeId, decision.epoch, nowMs, config.leaderLeaseTtlMs), nonce(),
       )
       if (r.ok) {
-        appendTrace(paths.traceFile, { at: nowMs, phase: 'leader-renew', nodeId, epoch: decision.epoch })
+        // ⚠ 不再逐条落痕（U16 · 2026-09-27）：续租是**稳定态**，逐条落 = 30s 一条的噪音
+        // （实测占全文件 92%）。改由 leaderTick 按「N 次 或 M 毫秒」汇总一条。
         return {
           note: '已续租 epoch ' + decision.epoch + '（TTL ' + String(Math.round(config.leaderLeaseTtlMs / 1000)) + 's）',
-          wrote: true,
+          wrote: true, action: 'renew',
         }
       }
-      return { note: '续租失败（' + String(r.error) + '）', wrote: false }
+      return { note: '续租失败（' + String(r.error) + '）', wrote: false, action: 'renew' }
     }
-    return { note: '未抢占（action=' + decision.action + '）——不写总线', wrote: false }
+    // ★ U16 补上的一条：`step-down`（自降级）此前**一个字节都不落痕**，而 leader.ts 头注
+    // 明写「立即自降为 worker **并落痕**」——承诺与实现不符，且静默的恰是防脑裂路径上最
+    // 重要的事件。它不写总线（wrote 恒 false），所以必须在**这里**落，不能靠 wrote 判定。
+    if (decision.action === 'step-down') {
+      appendTrace(paths.traceFile, {
+        at: nowMs, phase: 'leader-step-down', nodeId, epoch: decision.epoch, reason: decision.reason,
+      })
+    }
+    return { note: '未抢占（action=' + decision.action + '）——不写总线', wrote: false, action: decision.action }
   }
 
   ctx.tools.register(defineTool({
@@ -1024,10 +1036,19 @@ export function apply(ctx: Context, config: Config): void {
   // 不自动续租时，主脑只是**一次性任期**：TTL（缺省 90s）一过租约就失效，需再次 `claim`
   // ⇒ 那不算「网络有主脑」，只算「主脑闪现过」。设计 §15.1 本就写了「TTL 90s / 每 30s 续租」。
   // 定时器由 fiber 拥有并可清理（§5.24：回调一律 guarded，绝不让异常逃逸出定时器）。
+  // U16（2026-09-27）：续租落痕改为**汇总**——计数状态跨 tick 保存。take / step-down 是
+  // 状态变化、已由 applyLeaderDecision 逐条落；此处只补稳定态的那一条（分工见 leader-trace.ts）。
+  let leaderTraceState: LeaderTraceState = initialLeaderTraceState(Date.now())
+
   /** 一次自动续租尝试（逻辑与工具面共用 `applyLeaderDecision`，不另写一条写租约的路）。 */
   const leaderTick = (): void => {
-    const r = applyLeaderDecision(Date.now())
-    if (r.wrote) trace('leader-auto', { note: r.note })
+    const nowMs = Date.now()
+    const r = applyLeaderDecision(nowMs)
+    const t = decideLeaderTrace(r.action, r.wrote, leaderTraceState, nowMs)
+    leaderTraceState = t.next
+    if (t.decision.kind === 'leader-renew-summary') {
+      trace('leader-renew-summary', { count: t.decision.count, note: r.note })
+    }
   }
   // ⚠ 形状有讲究：守卫契约测试**按行**断言 `setInterval(() => { guarded(`——回调体必须**恰好是一次 guarded 调用**，
   // 不能把 guarded 埋进多行或三元表达式里（2026-09-23 实测被该契约抓过一次：契约是对的，改的是我的代码）。
