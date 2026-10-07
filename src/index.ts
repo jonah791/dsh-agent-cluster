@@ -379,7 +379,7 @@ export function apply(ctx: Context, config: Config): void {
   const sweepEmptyMailbox = (): { removed: string[]; kept: number } => {
     const removed: string[] = []
     const names = listDirs(paths.mailboxDir)
-    const me = { hostname: facts.hostname, profile }
+    const me = { hostname: facts.hostname, profile, selfId: nodeId }
     // 判据走纯函数（离线可测）：我的血统 + 完全空。目录内容由 IO 层探得后**显式传入**
     // ——「事实由 IO 查得、逻辑只做判定」是 A13 定下的同一分工（I12）。
     const reapable = pickReapableMailboxes(names, me, (name) => countFilesRecursive(join(paths.mailboxDir, name)))
@@ -726,12 +726,28 @@ export function apply(ctx: Context, config: Config): void {
       return 'delivered'
     }
     if (isExpired(msg, nowMs)) {
-      state = { ...state, counters: { ...state.counters, dead: state.counters.dead + 1 }, updatedAt: nowMs }
-      markHandledInPlace(msg.id, nowMs)
-      moveToBucket(inbox, fileName, 'dead', nonce())
-      persist()
-      trace('expired', { id: msg.id, ageMs: nowMs - msg.createdAt, ttlMs: msg.ttlMs })
-      return 'dead'
+      // 2026-10-07 修（主人定调：「设计的是以文件传输信息，而不是消息投递」）。
+      //
+      //   载荷是**文件**（信封本体 + meta.evidence[].inline.data 都在盘上），消息只是信封。
+      //   旧行为：超 ttlMs ⇒ markHandledInPlace + moveToBucket(..., 'dead') ⇒ **销毁**。
+      //     实测后果：3 条发给离线节点 node-b-3091 的消息（含一条从未送达的「爱丽丝庄园命名」
+      //     通告）在 24h 后被判死扔进 dead/——收件人即使回来也永远读不到。**内容完好，规则杀了它。**
+      //   新行为：**不判死、不销毁、不写 handled**——留在 inbox 等收件人回来，届时正常投递。
+      //     只落一次痕（复用 holdNoted 簿记，防每轮刷屏），把「有陈旧载荷」**变可见**而非静默丢弃。
+      //
+      //   ⚠ 边界如实说（不粉饰）：这会让长期没有收件人的信箱持续堆积——旧注释担心的正是这点。
+      //     取舍是刻意的：**堆积可见 > 静默丢失**。清理是显式动作（dead/ 与陈旧文件的处置由人决定），
+      //     不该由一个默认的 24 小时计时器替收发双方做销毁决定。
+      if (!isHoldNoted(state, msg.id)) {
+        state = markHoldNoted(state, msg.id, nowMs)
+        persist()
+        trace('expired-kept', {
+          id: msg.id, from: msg.from, kind: msg.kind,
+          ageMs: nowMs - msg.createdAt, ttlMs: msg.ttlMs,
+          note: '载荷是文件，不按消息 TTL 销毁——留在 inbox 等收件人；如需清理请显式处理',
+        })
+      }
+      return 'pending'
     }
     if (attemptCount(state, msg.id) >= config.maxAttempts) {
       state = { ...state, counters: { ...state.counters, dead: state.counters.dead + 1 }, updatedAt: nowMs }
@@ -1350,6 +1366,7 @@ export function apply(ctx: Context, config: Config): void {
         properties: {
           ok: { type: 'boolean', required: true },
           pending: { type: 'number', required: true },
+          dead: { type: 'number', required: true },
           items: {
             type: 'array',
             items: {
@@ -1369,9 +1386,15 @@ export function apply(ctx: Context, config: Config): void {
       },
       render: (_a: unknown, v: Record<string, unknown>) => {
         const items = Array.isArray(v['items']) ? (v['items'] as Array<Record<string, unknown>>) : []
-        if (items.length === 0) return [{ type: 'text', text: '收件箱为空（待投递 ' + String(v['pending']) + '）' }]
+        // 2026-10-07 修（主人定调：「设计的是以文件传输信息，而不是消息投递」）：
+        //   旧渲染头只报 `pending`（待投递），**死信计数根本不出现在头上**——于是「待投递 0」
+        //   看起来像一切正常，而 5 条死信（含一条从未送达的「爱丽丝庄园命名」通告）静静躺在
+        //   dead/ 里无人看见。信封可以轻，但**未取的载荷必须一眼可见**。
+        //   头一行现在固定报三个数：待投递 / 死信 / 列出条数。
+        const head = '收件箱｜待投递 ' + String(v['pending']) + ' · 死信 ' + String(v['dead'] ?? 0)
+        if (items.length === 0) return [{ type: 'text', text: head + '（列出 0 条）' }]
         const lines = items.map((i) => '- [' + String(i['state']) + '] ' + String(i['from']) + '/' + String(i['kind'] ?? 'chat') + ' · ' + String(i['ageText'] ?? '') + '\n  ' + String(i['text']))
-        return [{ type: 'text', text: '收件箱（待投递 ' + String(v['pending']) + '，列出 ' + String(items.length) + ' 条）\n' + lines.join('\n') }]
+        return [{ type: 'text', text: head + '，列出 ' + String(items.length) + ' 条\n' + lines.join('\n') }]
       },
     },
     async execute(args: { limit?: number; peer?: string; state?: string }) {
@@ -1405,7 +1428,9 @@ export function apply(ctx: Context, config: Config): void {
       if (want === 'all' || want === 'pending') for (const f of listJsonFiles(inbox)) push(f, inbox, 'pending')
       if (want === 'all' || want === 'done') for (const f of listJsonFiles(join(inbox, 'done'))) push(f, join(inbox, 'done'), 'done')
       if (want === 'all' || want === 'dead') for (const f of listJsonFiles(join(inbox, 'dead'))) push(f, join(inbox, 'dead'), 'dead')
-      return { ok: true, pending: pendingFiles().length, items: items.slice(0, limit) }
+      // 2026-10-07：返回值补 `dead` 计数——死信过去只作为 items 里的普通条目出现，
+      //   调用方若只看 pending 就会以为「没消息 = 没事」。现在三个数一起回。
+      return { ok: true, pending: pendingFiles().length, dead: listJsonFiles(join(inbox, 'dead')).length, items: items.slice(0, limit) }
     },
   }))
 
