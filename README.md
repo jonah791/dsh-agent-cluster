@@ -12,7 +12,7 @@ compat: 总线协议 v1；alice-workbench 应用只读同一批标准产物（tr
 
 ![version](https://img.shields.io/badge/version-0.1.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
-![tests](https://img.shields.io/badge/tests-58%20passed-brightgreen)
+![tests](https://img.shields.io/badge/tests-175%20passed-brightgreen)
 ![node](https://img.shields.io/badge/node-%E2%89%A520-informational)
 
 DSH 多实例通讯底座 —— 让本机（或共享盘）上的**多个 DeepSeek Harness 实例互相说话**，用来搭多智能体工作台。
