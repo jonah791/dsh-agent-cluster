@@ -365,7 +365,7 @@ export function apply(ctx: Context, config: Config): void {
    * 信箱空壳清扫（2026-09-26 · t-afbab493）：A13 收了前身的**心跳与状态**，却没管它留下的
    * **信箱目录**——web 每次重启因同名心跳新鲜而改名避让（`web-0` → `web-0-<pid>`），
    * 每个新 nodeId 就多一个 `mailbox/<nodeId>/`；实测一次扫出 **188 个空壳**
-   * （2026-09-26 22:54，形态清一色 `LAPTOP-BF4IAPLM-web-<pid>`；已手工清理至 10）。
+   * （2026-09-26 22:54，形态清一色 `<host>-web-<pid>`；已手工清理至 10）。
    *
    * 判据（三条，与 A13 同源）：
    *   ① 只碰**自己的血统**——目录名即 nodeId，走 `isOwnLineage`；别人的目录由各自所有者负责；

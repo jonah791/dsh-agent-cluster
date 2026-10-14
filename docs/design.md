@@ -517,9 +517,9 @@ state/primary-lease.json = { owner, atMs, ttlMs: 90000, epoch: 12 }
   ② `canLead` 把 `leaderCapable` 列为**首条判据**（`leader.ts`）；③ `leaderCandidates` 读它。
   **无需定时器、无需持久化「首次观察时刻」、不引入脑裂风险**（无候选 ⇒ 显式无主态，而非假造一个主脑）。
   **真实总线实测（2026-09-23 13:09）**：`status` 由「待接管 tavern-3081」变为「**待接管 web-0（本节点胜出，接管 epoch 1）**」；
-  `claim` 成功 → `state/primary-lease-1.json` = `{owner: LAPTOP-BF4IAPLM-web-0, epoch: 1, atMs: 1790140153675, ttlMs: 90000}`；
+  `claim` 成功 → `state/primary-lease-1.json` = `{owner: <host>-web-0, epoch: 1, atMs: 1790140153675, ttlMs: 90000}`；
   状态回读转为**已就任**分支「主脑：web-0（epoch 1，租约剩 83s，租约仍有效，续租）」；
-  轨迹留痕 `{"phase":"leader-take","nodeId":"LAPTOP-BF4IAPLM-web-0","epoch":1}`。
+  轨迹留痕 `{"phase":"leader-take","nodeId":"<host>-web-0","epoch":1}`。
   测试：143/143（+3 条活性回归/尸体样本：无能力者不合格、更新鲜的无能力者不得抢走主脑、全网无人具备 ⇒ 显式无主）。
 - **工具面已接线（原边界①已闭合）**：`cluster_leader` 已注册并经重启生效；早期记录的「未接线」不再成立。
 - ~~**心跳不带端类型**~~ ⇒ **已补并实测**（2026-09-23 13:22，配置 `nodeKind: desktop`）：
