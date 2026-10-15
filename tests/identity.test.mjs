@@ -173,3 +173,17 @@ test('pickReapableMailboxes：只挑「我的血统 + 完全空」——别人�
   // 空名单 ⇒ 空（幂等）
   assert.deepEqual(pickReapableMailboxes([], me, () => 0), [])
 })
+
+test('pickReapableMailboxes 尸体样本：**绝不回收当前节点自己的收件箱**（2026-09-30 妹妹首启死锁）', () => {
+  // 事故：桌面端妹妹首启轨迹 `phase:"reap-mailbox-empty", removed:1, ids:["…-desktop-19387"]`
+  // —— 她把自己**刚建好的空收件箱**当空壳删了。新节点首启时自己的收件箱**必然为空** ⇒ 必然自杀；
+  // 而发送方此前又不建目录 ⇒ 新节点永远收不到第一封信。
+  const me = { hostname: 'H', profile: 'desktop', selfId: 'H-desktop-19387' }
+  const names = ['H-desktop-19387', 'H-desktop-999'] // 前者=自己（空），后者=同血统的死前身（空）
+  const filesOf = () => 0
+  assert.deepEqual(pickReapableMailboxes(names, me, filesOf), ['H-desktop-999'], '自己的 nodeId 必须被排除')
+
+  // 反向对照：去掉 selfId ⇒ 自己的收件箱会入选（证明这一条判据真的在拦，不是恒真）
+  const withoutSelf = pickReapableMailboxes(names, { hostname: 'H', profile: 'desktop' }, filesOf)
+  assert.ok(withoutSelf.includes('H-desktop-19387'), '对照：不带 selfId 时它会入选 ⇒ 该判据有区分力')
+})

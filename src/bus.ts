@@ -107,6 +107,11 @@ export function atomicWriteJson(dest: string, value: unknown, nonce: string): { 
 export function publishNoClobber(dest: string, value: unknown, nonce: string): { ok: boolean; duplicate: boolean; error?: string; degraded?: boolean } {
   if (existsSync(dest)) return { ok: true, duplicate: true }
   const tmp = tmpName(dest, nonce)
+  // 2026-09-30 事故修复：本文件头部约定「收件箱由**发送方**创建」，但此前漏了 mkdir ⇒
+  // 目标节点若刚首启（它的空收件箱被 reaper 清掉）或从未启动过，投递以 ENOENT 失败。
+  try {
+    mkdirSync(join(dest, '..'), { recursive: true })
+  } catch { /* 目录已存在；真失败由下面的写文件报出 */ }
   try {
     writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8')
   } catch (e) {

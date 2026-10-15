@@ -183,17 +183,23 @@ export function shouldReap(
  * 即便它误给 0，也只是多清一个空目录（`removeDirIfEmpty` 只用 `rmdir`，仍不会删文件）。
  *
  * @param names - `mailbox/` 下的目录名（目录名即 nodeId）
- * @param me - 本机 hostname + profile（血统前缀的来源）
+ * @param me - 本机 hostname + profile（血统前缀的来源）+ `selfId`（**当前节点自己的 nodeId**）
  * @param filesOf - 目录名 → 该目录**递归文件数**（IO 层探得）
  * @returns 可回收的目录名（其余一律保留）
+ *
+ * ⚠ 2026-09-30 事故（桌面端妹妹首启）：本函数原先只判「自己的血统 + 空」，于是把
+ * **当前节点自己的收件箱**也当空壳删了——新节点首启时自己的收件箱**必然为空**，必然被删；
+ * 而发送方又不建目录 ⇒ **新节点永远收不到第一封信**（死锁）。故加 `selfId` 排除。
+ * 与 `shouldReap` 的 `id === nodeId` 跳过同源。
  */
 export function pickReapableMailboxes(
   names: readonly string[],
-  me: { hostname: string; profile: string },
+  me: { hostname: string; profile: string; selfId?: string },
   filesOf: (name: string) => number,
 ): string[] {
   return names.filter(
     (name) =>
+      name !== me.selfId &&
       isOwnLineage({ nodeId: name, hostname: me.hostname, profile: me.profile }, me) &&
       filesOf(name) === 0,
   )

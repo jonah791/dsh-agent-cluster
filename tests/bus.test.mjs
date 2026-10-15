@@ -64,6 +64,19 @@ test('publishNoClobber：首次创建；重复创建 → duplicate 且**不覆�
   assert.equal(JSON.parse(readFileSync(dest, 'utf8')).text, 'first')
 })
 
+test('publishNoClobber 尸体样本：目标收件箱目录**不存在**时由发送方建成（2026-09-30 首信死锁）', () => {
+  // 事故：`C:\Users\demo\.dsh-cluster\mailbox\<host>-desktop-19387\` 不存在 ⇒
+  // 投递以 ENOENT 失败（"写临时文件失败"）。本文件头部约定「收件箱由发送方创建」，但此前漏了 mkdir。
+  const root = freshRoot()
+  const p = busPaths(root)
+  ensureBusDirs(p, 'me')
+  const dest = join(inboxDir(p, 'peer-never-started'), 'm-9.json')
+  assert.equal(existsSync(inboxDir(p, 'peer-never-started')), false, '前置：目标目录确实不存在')
+  const r = publishNoClobber(dest, { id: 'm-9' }, 'n1')
+  assert.deepEqual([r.ok, r.duplicate], [true, false], '发送方必须自建收件箱目录')
+  assert.equal(JSON.parse(readFileSync(dest, 'utf8')).id, 'm-9')
+})
+
 test('readJsonValue 尸体样本：坏 JSON / 不存在 → 分类错误而非抛', () => {
   const root = freshRoot()
   const bad = join(root, 'bad.json')
