@@ -129,6 +129,7 @@
 | `cluster_send` | `to`, `text`, `kind?`, `replyTo?`, `ttlMs?` | 是否写入、目标在线与否、消息 id；目标不存在 → 明确错误（不静默丢弃） |
 | `cluster_broadcast` | `text`, `kind?`, `ttlMs?` | 逐目标写入结果表（含离线目标） |
 | `cluster_inbox` | `limit?`, `peer?`, `pendingOnly?` | 收件箱条目（含已归档），按时间倒序 |
+| `cluster_leader` | `action?`（`status` = 只读查看，缺省；`claim` = 以本节点身份抢占租约） | 当前主脑、`epoch`、自身 `kind`/`eligible` 与资格理由；主脑**可迁移**——租约 TTL 缺省 90s，过期后任何合格节点都能抢 |
 
 ### 5.4 投递路径（调用点清单）
 
