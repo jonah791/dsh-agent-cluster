@@ -990,6 +990,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'cluster_leader',
+    deferLoading: true,
     description: '主脑（leader）：查看当前主脑与各候选资格，或以本节点身份抢占租约。主脑**可迁移**——租约（TTL 缺省 90s）过期后任何合格节点都能接管，epoch 单调递增防脑裂；看到更高 epoch 的节点自降为 worker。无主时点对点通信照常（主脑只提供协调，不是单点依赖）。',
     parameters: {
       action: { type: 'string', description: 'status=只读查看（缺省）；claim=以本节点身份抢占租约' },
@@ -1081,6 +1082,7 @@ export function apply(ctx: Context, config: Config): void {
   // ── 工具面 ──
   ctx.tools.register(defineTool({
     name: 'cluster_status',
+    deferLoading: true,
     description: '本节点在 DSH 集群中的身份与总线健康：nodeId/角色/总线目录/在线邻居数/收发计数/待投递数/最近轨迹。集群内消息异常（发不出、收不到）时先调它。',
     parameters: {},
     output: {
@@ -1183,6 +1185,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'cluster_nodes',
+    deferLoading: true,
     description: '列出集群名册：每个 DSH 实例的 nodeId / 角色 / profile / 地址 / 在线判定 / 最后心跳。发消息前用它确认目标 id；要了解某个实例的能力与状态，倾向直接给它发消息问（cluster_send）。',
     parameters: {
       includeOffline: { type: 'boolean', description: '是否包含已离线节点（默认 true；false 只看在线）' },
@@ -1264,6 +1267,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'cluster_send',
+    deferLoading: true,
     description: '给集群中的另一个 DSH 实例发一条消息（写入它的收件箱；对方轮询到后会把消息注入自己的会话）。kind 语义：chat=对话/task=派活/result=回结果/event=事件/alert=告警。目标必须已在名册（先用 cluster_nodes 确认）。离线节点也可投递，消息等它上线后送达。',
     parameters: {
       to: { type: 'string', description: '目标节点 id（来自 cluster_nodes）', required: true },
@@ -1305,6 +1309,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'cluster_broadcast',
+    deferLoading: true,
     description: '给集群中除自己以外的所有实例广播一条消息（逐目标写入各自收件箱）。用于通知、协同信号、全局广播。离线节点默认也投递（等它上线）。',
     parameters: {
       text: { type: 'string', description: '消息正文', required: true },
@@ -1353,6 +1358,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'cluster_inbox',
+    deferLoading: true,
     description: '查看本实例的收件箱：待投递（pending）、已投递归档（done）、死信（dead）与已归档消息。心跳/总线正常但怀疑漏消息时用它核对。回执不是自动的——回消息用 cluster_send（可带 replyTo）。',
     parameters: {
       limit: { type: 'number', description: '返回条数上限（默认 20）' },
@@ -1437,6 +1443,7 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- cluster_members（成员册：身份与信任，`docs/members.md` §3/§4）----------
   ctx.tools.register(defineTool({
     name: 'cluster_members',
+    deferLoading: true,
     description: '列出网络成员册（身份与信任）：memberId / kind / trust / 能力 / 端点 / 协议，以及跨机承载状态。**trust=unknown 一律不投也不收**——不要靠「自称」当成员。',
     parameters: {},
     output: {
@@ -1495,6 +1502,7 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- cluster_peer（跨机投递，`docs/members.md` §5.3）----------
   ctx.tools.register(defineTool({
     name: 'cluster_peer',
+    deferLoading: true,
     description: '把一条消息推给**跨机成员**（按其成员册里的 endpoint + HMAC 认证）。同机成员请用 cluster_send。要求已配 secret，且 endpoint 为 https 或本机回环（明文 http 到非回环一律拒发）。',
     parameters: {
       to: { type: 'string', required: true, description: '成员 id（见 cluster_members）' },
@@ -1534,6 +1542,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'cluster_invite',
+    deferLoading: true,
     description: '签发一张「入网令牌」给某个智能体——它一步就能接入本网络（**不需要知道我的总线目录**）。令牌里带网络名、我的入站地址、该成员**专属**密钥与到期时间。签发即准入（同时写进成员册）。⚠ 令牌是凭据：只该经可信渠道交给对方，不要公开发。',
     parameters: {
       member: { type: 'string', required: true, description: '被邀请者的成员 id（一张令牌只准入这一个 id）；传 * = **开放令牌**：谁拿到谁能进、身份由入网方自报' },
@@ -1563,6 +1572,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.tools.register(defineTool({
     name: 'cluster_join',
+    deferLoading: true,
     description: '用一张入网令牌接入一个智能体网络：解析 → 校验（令牌是否授予**本节点**）→ 把入网请求推到令牌里的地址 → 双方互相入册。成功后本节点与主脑即可互相投递（cluster_peer）。',
     parameters: {
       token: { type: 'string', required: true, description: '对方给的入网令牌（形态 dshc1.<载荷>.<指纹>）' },
